@@ -115,15 +115,6 @@ void sendMIDIRealTime(uint8_t message) {
     midi.SendMessage(data, 1);
 }
 
-// ------------------------------------------------------------------
-// Filters (Svf for highpass and lowpass)
-// ------------------------------------------------------------------
-Svf hp_l, hp_r;
-Svf lp_l, lp_r;
-
-float pot_lp_cutoff = 3000.0f;
-float pot_lp_res    = 0.5f;
-float pot_hp_cutoff = 50.0f;
 
 // ------------------------------------------------------------------
 // Limiter on external return
@@ -188,10 +179,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     bool reverse = rev_switch.Pressed();
     playhead_speed = reverse ? -speed_mag : speed_mag;
 
-    // Update filter parameters (unchanged)
-    pot_lp_cutoff = 50.0f + (hw.adc.GetFloat(2) * (12000.0f - 50.0f));   // actually A2 is speed, so we might need to re‑map pots; but for now keep as‑is
-    // ... (filter update code as before) ...
-
     for (size_t i = 0; i < size; i++)
     {
         // --- Feedback ramp ---
@@ -213,18 +200,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         float gain_stage_l = ext_raw_l * pot_fb_gain;
         float gain_stage_r = ext_raw_r * pot_fb_gain;
 
-        hp_l.Process(gain_stage_l);
-        hp_r.Process(gain_stage_r);
-        float hp_out_l = hp_l.High();
-        float hp_out_r = hp_r.High();
-
-        lp_l.Process(hp_out_l);
-        lp_r.Process(hp_out_r);
-        float lp_out_l = lp_l.Low();
-        float lp_out_r = lp_r.Low();
-
-        float limited_l = lp_out_l;
-        float limited_r = lp_out_r;
+        float limited_l = gain_stage_l;
+        float limited_r = gain_stage_r;
         apply_limiter(limited_l, limited_r);
 
         float feedback_l = limited_l * fb_ramp_gain * FB_ATTEN;
@@ -403,13 +380,6 @@ int main(void)
     fb_ramp_step = 1.0f / ramp_samples;
     attack_coeff  = 1.0f - expf(-1.0f / (ATTACK_MS  * sample_rate / 1000.0f));
     release_coeff = 1.0f - expf(-1.0f / (RELEASE_MS * sample_rate / 1000.0f));
-
-    hp_l.Init(sample_rate); hp_r.Init(sample_rate);
-    lp_l.Init(sample_rate); lp_r.Init(sample_rate);
-    hp_l.SetFreq(50.0f); hp_r.SetFreq(50.0f);
-    hp_l.SetRes(0.707f); hp_r.SetRes(0.707f);
-    lp_l.SetFreq(3000.0f); lp_r.SetFreq(3000.0f);
-    lp_l.SetRes(0.5f); lp_r.SetRes(0.5f);
 
     // --- Switches ---
     mode_up.Init(seed::D0,   sample_rate / 48.0f);
