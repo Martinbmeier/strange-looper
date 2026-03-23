@@ -94,6 +94,10 @@ int   beats_per_loop = 8;
 bool  send_clock = false;
 bool  sent_start = false;
 
+// sync utils
+Switch sync_sw;   // D6
+bool sync_requested = false;
+
 void update_clock_inc() {
     if (loop_exists && beats_per_loop > 0) {
         float samples_per_clock = (float)loop_len / (beats_per_loop * 24.0f);
@@ -339,6 +343,11 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                 midi_clock_beat_counter++;
                 if (midi_clock_beat_counter >= 24) {
                     midi_clock_beat_counter = 0;
+                    if (sync_requested) {
+                        playhead = 0;
+                        playhead_phase = 0.0f;
+                        sync_requested = false;
+                    }
                     midi_led.Write(true);
                     led_timer = LED_BLINK_DURATION_SAMPLES;
                 }
@@ -364,6 +373,8 @@ int main(void)
     midi.Init(midi_config);
     midi_led.Init(seed::D5, GPIO::Mode::OUTPUT);
     midi_led.Write(false);
+
+    sync_sw.Init(seed::D6, sample_rate / 48.0f);
 
     // --- ADC for pots (A0, A1, A2) only; A3,A4 unused ---
     AdcChannelConfig adc_config[5];
@@ -432,6 +443,11 @@ int main(void)
         if (fb_state != last_fb_state) {
             fb_target_gain = (fb_state != FB_OFF) ? 1.0f : 0.0f;
             last_fb_state = fb_state;
+        }
+
+        sync_sw.Debounce();
+        if (sync_sw.RisingEdge()) {      // when pressed and released (or just pressed)
+            sync_requested = true;
         }
 
         Mode current_mode = get_mode();
