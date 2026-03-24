@@ -8,6 +8,7 @@
 
 #include "daisy_seed.h"
 #include "daisysp.h"
+#include <cstdlib>
 
 using namespace daisy;
 using namespace daisysp;
@@ -19,6 +20,7 @@ DaisySeed hw;
 // ------------------------------------------------------------------
 #define MAX_LOOP_LEN (48000 * 60)          // 60 seconds at 48kHz
 float DSY_SDRAM_BSS loop_buffer[MAX_LOOP_LEN];
+float DSY_SDRAM_BSS temp_buffer[MAX_LOOP_LEN];
 
 size_t loop_start = 0;      // physical index where current loop begins
 size_t loop_len   = 0;      // length of current loop in stereo samples
@@ -98,6 +100,9 @@ bool  sent_start = false;
 Switch sync_sw;   // D6
 bool sync_requested = false;
 
+Switch remix_sw;  
+bool remix_requested = false;
+
 void update_clock_inc() {
     if (loop_exists && beats_per_loop > 0) {
         float samples_per_clock = (float)loop_len / (beats_per_loop * 24.0f);
@@ -153,6 +158,117 @@ float fb_target_gain  = 0.0f;
 const float FB_RAMP_TIME_MS = 10.0f;
 float fb_ramp_step;
 const float FB_ATTEN = 0.92f;
+
+
+// ------------------------------------------------------------------
+// Loop remixing function (called when remix button is pressed)
+// ------------------------------------------------------------------
+void remix_loop() {
+    if (!loop_exists) return;
+    if (beats_per_loop <= 0) return;
+    if (loop_len % beats_per_loop != 0) return; // must be divisible
+
+    // Segment size in stereo samples (must be integer)
+    size_t seg_samples = loop_len / beats_per_loop;
+    if (seg_samples < 2) return; // too small
+
+    // Create a list of segment indices
+    size_t n = beats_per_loop;
+    size_t indices[n];
+    for (size_t i = 0; i < n; i++) indices[i] = i;
+
+    // Shuffle indices (Fisher-Yates)
+    for (size_t i = n - 1; i > 0; i--) {
+        size_t j = rand() % (i + 1);
+        size_t tmp = indices[i];
+        indices[i] = indices[j];
+        indices[j] = tmp;
+    }
+
+    // For each target segment, process source segment with a random effect
+    for (size_t target = 0; target < n; target++) {
+        size_t src = indices[target];
+        size_t src_start = src * seg_samples;
+        size_t dst_start = target * seg_samples;
+
+        // Choose effect (0 = normal, 1 = reverse, 2 = double speed, 3 = stutter)
+        int effect = rand() % 4;   // adjust as desired
+
+        switch (effect) {
+            case 0: // normal copy
+                for (size_t j = 0; j < seg_samples; j++) {
+                    size_t src_idx = (loop_start + src_start + j) % MAX_LOOP_LEN;
+                    size_t dst_idx = (loop_start + dst_start + j) % MAX_LOOP_LEN;
+                    temp_buffer[dst_idx]     = loop_buffer[src_idx];
+                    temp_buffer[dst_idx + 1] = loop_buffer[src_idx + 1];
+                }
+                break;
+
+            case 1: // reverse
+                for (size_t j = 0; j < seg_samples; j++) {
+                    size_t src_idx = (loop_start + src_start + (seg_samples - 1 - j)) % MAX_LOOP_LEN;
+                    size_t dst_idx = (loop_start + dst_start + j) % MAX_LOOP_LEN;
+                    temp_buffer[dst_idx]     = loop_buffer[src_idx];
+                    temp_buffer[dst_idx + 1] = loop_buffer[src_idx + 1];
+                }
+                break;
+
+            case 2: // double speed (play twice in same time)
+                // compress to half length by taking every other sample, then repeat twice
+                // half_len = seg_samples / 2 (must be integer)
+                if (seg_samples % 2 != 0) {
+                    // fallback to normal if odd length
+                    for (size_t j = 0; j < seg_samples; j++) {
+                        size_t src_idx = (loop_start + src_start + j) % MAX_LOOP_LEN;
+                        size_t dst_idx = (loop_start + dst_start + j) % MAX_LOOP_LEN;
+                        temp_buffer[dst_idx]     = loop_buffer[src_idx];
+                        temp_buffer[dst_idx + 1] = loop_buffer[src_idx + 1];
+                    }
+                } else {
+                    size_t half = seg_samples / 2;
+                    // first half of output: compressed source (every other sample)
+                    for (size_t j = 0; j < half; j++) {
+                        size_t src_idx = (loop_start + src_start + j * 2) % MAX_LOOP_LEN;
+                        size_t dst_idx = (loop_start + dst_start + j) % MAX_LOOP_LEN;
+                        temp_buffer[dst_idx]     = loop_buffer[src_idx];
+                        temp_buffer[dst_idx + 1] = loop_buffer[src_idx + 1];
+                    }
+                    // second half: repeat the first half
+                    for (size_t j = 0; j < half; j++) {
+                        size_t dst_idx = (loop_start + dst_start + half + j) % MAX_LOOP_LEN;
+                        size_t src_idx = (loop_start + dst_start + j) % MAX_LOOP_LEN;
+                        temp_buffer[dst_idx]     = temp_buffer[src_idx];
+                        temp_buffer[dst_idx + 1] = temp_buffer[src_idx + 1];
+                    }
+                }
+                break;
+
+            case 3: // stutter: repeat first half twice (simple stutter)
+                {
+                    size_t half = seg_samples / 2;
+                    if (half == 0) half = seg_samples; // safety
+                    for (size_t j = 0; j < seg_samples; j++) {
+                        size_t src_idx = (loop_start + src_start + (j % half)) % MAX_LOOP_LEN;
+                        size_t dst_idx = (loop_start + dst_start + j) % MAX_LOOP_LEN;
+                        temp_buffer[dst_idx]     = loop_buffer[src_idx];
+                        temp_buffer[dst_idx + 1] = loop_buffer[src_idx + 1];
+                    }
+                }
+                break;
+        }
+    }
+
+    // Copy temporary buffer back to loop buffer
+    for (size_t i = 0; i < loop_len; i++) {
+        size_t phys = (loop_start + i) % MAX_LOOP_LEN;
+        loop_buffer[phys]     = temp_buffer[phys];
+        loop_buffer[phys + 1] = temp_buffer[phys + 1];
+    }
+
+    // Reset playhead to start of loop for consistent sync
+    playhead = 0;
+    playhead_phase = 0.0f;
+}
 
 // ------------------------------------------------------------------
 // Audio Callback
@@ -367,6 +483,7 @@ int main(void)
 {
     hw.Init();
     sample_rate = hw.AudioSampleRate();
+    srand(System::GetNow());
 
     // --- MIDI ---
     MidiUartHandler::Config midi_config;
@@ -375,8 +492,9 @@ int main(void)
     midi_led.Write(false);
 
     sync_sw.Init(seed::D6, sample_rate / 48.0f);
+    remix_sw.Init(seed::D7, sample_rate / 48.0f);
 
-    // --- ADC for pots (A0, A1, A2) only; A3,A4 unused ---
+    // --- ADC for pots (A0, A1, A2) only; A3,A4 unused for now ---
     AdcChannelConfig adc_config[5];
     adc_config[0].InitSingle(seed::A0);
     adc_config[1].InitSingle(seed::A1);
@@ -386,7 +504,7 @@ int main(void)
     hw.adc.Init(adc_config, 5);
     hw.adc.Start();
 
-    // --- Ramp, limiter, filters ---
+    // --- Ramp, limiter ---
     float ramp_samples = FB_RAMP_TIME_MS * sample_rate / 1000.0f;
     fb_ramp_step = 1.0f / ramp_samples;
     attack_coeff  = 1.0f - expf(-1.0f / (ATTACK_MS  * sample_rate / 1000.0f));
@@ -448,6 +566,17 @@ int main(void)
         sync_sw.Debounce();
         if (sync_sw.RisingEdge()) {      // when pressed and released (or just pressed)
             sync_requested = true;
+        }
+
+        remix_sw.Debounce();
+        if (remix_sw.RisingEdge()) {
+            remix_requested = true;
+        }
+
+        if (remix_sw.RisingEdge()) {
+            if (loop_exists && get_mode() != MODE_RECORD) {
+                remix_loop();
+            }
         }
 
         Mode current_mode = get_mode();
