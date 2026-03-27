@@ -306,8 +306,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
     // Read pots
     pot_output_volume = hw.adc.GetFloat(0);
-    pot_fb_gain       = hw.adc.GetFloat(1) * 2.0f;   // 0..2
-    pot_speed         = hw.adc.GetFloat(2);
+    pot_fb_gain       = hw.adc.GetFloat(1) * 2.0f;   // 0..2 // would like to make this more intuitive....
+    pot_speed         = hw.adc.GetFloat(2); // TODO change this to a 5 position switch with some resistors (no code change but calculate it)
 
     // Map speed pot to speed magnitude (positive)
     float speed_mag;
@@ -600,7 +600,7 @@ int main(void)
             }
         }
 
-        float v = hw.adc.GetFloat(5);   // 0..1 corresponds to 0..3.3V
+        float v = hw.adc.GetFloat(3);   // 0..1 corresponds to 0..3.3V
         int new_base = 4;               // default
         if (v < 0.2f) new_base = 3;     // near 0V
         else if (v > 0.8f) new_base = 5; // near 3.3V
