@@ -44,6 +44,7 @@ Switch mode_down;    // D1 – SPDT down (Overdub)
 Switch fb_up;        // D2 – SPDT up (Feedback OFF)
 Switch fb_down;      // D3 – SPDT down (Feedback RECORD)
 Switch rev_switch;   // D4 – SPST for reverse playback
+float base_voltage = 0.0f; // ADC SPDT switch for base voltage (for control of base loop division)
 
 // ------------------------------------------------------------------
 // Mode decoding
@@ -92,7 +93,11 @@ float pot_speed         = 0.5f;   // raw pot value, mapped to speed later
 // MIDI clock
 float clock_phase = 0.0f;
 float clock_inc   = 0.0f;
-int   beats_per_loop = 8;
+
+// Beats per loop base and multiplier
+int base_beats = 4;      // initial base
+int multiplier = 1;      // multiplication factor (1, 2, 4, 8...)
+int beats_per_loop = base_beats * multiplier;
 bool  send_clock = false;
 bool  sent_start = false;
 
@@ -130,6 +135,17 @@ void sendMIDIRealTime(uint8_t message) {
     midi.SendMessage(data, 1);
 }
 
+
+void update_beats_per_loop() {
+    int new_beats = base_beats * multiplier;
+    // Clamp to a reasonable range, e.g., 1 to 32
+    if (new_beats < 1) new_beats = 1;
+    if (new_beats > 32) new_beats = 32;
+    if (new_beats != beats_per_loop) {
+        beats_per_loop = new_beats;
+        update_clock_inc();   // recalc MIDI clock
+    }
+}
 
 // ------------------------------------------------------------------
 // Limiter on external return
@@ -570,21 +586,29 @@ int main(void)
         beat_down_sw.Debounce();
 
         if (beat_up_sw.RisingEdge()) {
-            // Double the beats per loop (if within limit)
-            int new_beats = beats_per_loop * 2;
-            if (new_beats <= MAX_BEATS) {
-                beats_per_loop = new_beats;
-                update_clock_inc();    // recalculate MIDI clock increment
+            int new_mult = multiplier * 2;
+            if (new_mult <= 64) {          
+                multiplier = new_mult;
+                update_beats_per_loop();
+            }
+        }
+        if (beat_down_sw.RisingEdge()) {
+            int new_mult = multiplier / 2;
+            if (new_mult >= 1) {
+                multiplier = new_mult;
+                update_beats_per_loop();
             }
         }
 
-        if (beat_down_sw.RisingEdge()) {
-            // Halve the beats per loop (if not below min)
-            int new_beats = beats_per_loop / 2;
-            if (new_beats >= MIN_BEATS) {
-                beats_per_loop = new_beats;
-                update_clock_inc();
-            }
+        float v = hw.adc.GetFloat(5);   // 0..1 corresponds to 0..3.3V
+        int new_base = 4;               // default
+        if (v < 0.2f) new_base = 3;     // near 0V
+        else if (v > 0.8f) new_base = 5; // near 3.3V
+        else new_base = 4;               // middle voltage
+        if (new_base != base_beats) {
+            base_beats = new_base;
+            multiplier = 1;               // reset multiplier when base changes
+            update_beats_per_loop();
         }
 
         FeedbackState fb_state = get_fb_state();
