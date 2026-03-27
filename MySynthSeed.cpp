@@ -18,7 +18,7 @@ DaisySeed hw;
 // ------------------------------------------------------------------
 // Loop buffer (stereo interleaved)
 // ------------------------------------------------------------------
-#define MAX_LOOP_LEN (48000 * 60)          // 60 seconds at 48kHz
+#define MAX_LOOP_LEN (48000 * 60 * 2)          // 60 seconds at 48kHz
 float DSY_SDRAM_BSS loop_buffer[MAX_LOOP_LEN];
 float DSY_SDRAM_BSS temp_buffer[MAX_LOOP_LEN];
 
@@ -95,6 +95,12 @@ float clock_inc   = 0.0f;
 int   beats_per_loop = 8;
 bool  send_clock = false;
 bool  sent_start = false;
+
+Switch beat_up_sw;      // D9 – increase beats per loop
+Switch beat_down_sw;    // D10 – decrease beats per loop
+
+const int MIN_BEATS = 1;
+const int MAX_BEATS = 64;  // or 16
 
 // sync utils
 Switch sync_sw;   // D6
@@ -517,6 +523,9 @@ int main(void)
     fb_down.Init(seed::D3,   sample_rate / 48.0f);
     rev_switch.Init(seed::D4, sample_rate / 48.0f);
 
+    beat_up_sw.Init(seed::D9, sample_rate / 48.0f);
+    beat_down_sw.Init(seed::D10, sample_rate / 48.0f);
+
     // --- External codec SAI2 ---
     SaiHandle         external_sai_handle;
     SaiHandle::Config external_sai_cfg;
@@ -556,6 +565,27 @@ int main(void)
         fb_up.Debounce();
         fb_down.Debounce();
         rev_switch.Debounce();
+
+        beat_up_sw.Debounce();
+        beat_down_sw.Debounce();
+
+        if (beat_up_sw.RisingEdge()) {
+            // Double the beats per loop (if within limit)
+            int new_beats = beats_per_loop * 2;
+            if (new_beats <= MAX_BEATS) {
+                beats_per_loop = new_beats;
+                update_clock_inc();    // recalculate MIDI clock increment
+            }
+        }
+
+        if (beat_down_sw.RisingEdge()) {
+            // Halve the beats per loop (if not below min)
+            int new_beats = beats_per_loop / 2;
+            if (new_beats >= MIN_BEATS) {
+                beats_per_loop = new_beats;
+                update_clock_inc();
+            }
+        }
 
         FeedbackState fb_state = get_fb_state();
         if (fb_state != last_fb_state) {
