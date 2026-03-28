@@ -1,5 +1,8 @@
 /**
- * Working looper with external feedback and variable speed playback.
+ * Working looper with external feedback, variable speed playback,
+ * and independent left/right playheads with optional phase offset.
+ * 
+ * Phase offset switch on D11: when engaged, left channel plays one beat ahead.
  * 
  * - Speed pot on A2: stepped speeds (0.5, 2/3, 1, 1.5, 2)
  * - Reverse switch on D4: forward/reverse
@@ -26,9 +29,16 @@ size_t loop_start = 0;      // physical index where current loop begins
 size_t loop_len   = 0;      // length of current loop in stereo samples
 bool   loop_exists = false;
 
-// Variable‑speed playhead
-float playhead_phase = 0.0f;   // fractional part
-int   playhead       = 0;      // integer part (stereo sample index)
+// Playback pointers (left and right, in stereo frames)
+size_t read_left   = 0;
+size_t read_right  = 0;
+float  read_phase_left  = 0.0f;
+float  read_phase_right = 0.0f;
+
+// Write pointer (always forward)
+size_t write_pos = 0;
+
+// Playback speed
 float playhead_speed = 1.0f;   // positive forward, negative reverse
 
 // ------------------------------------------------------------------
@@ -44,7 +54,7 @@ Switch mode_down;    // D1 – SPDT down (Overdub)
 Switch fb_up;        // D2 – SPDT up (Feedback OFF)
 Switch fb_down;      // D3 – SPDT down (Feedback RECORD)
 Switch rev_switch;   // D4 – SPST for reverse playback
-float base_voltage = 0.0f; // ADC SPDT switch for base voltage (for control of base loop division)
+Switch phase_shift_sw; // D11 – SPST for left channel phase offset
 
 // ------------------------------------------------------------------
 // Mode decoding
@@ -105,7 +115,7 @@ Switch beat_up_sw;      // D9 – increase beats per loop
 Switch beat_down_sw;    // D10 – decrease beats per loop
 
 const int MIN_BEATS = 1;
-const int MAX_BEATS = 64;  // or 16
+const int MAX_BEATS = 64;
 
 // sync utils
 Switch sync_sw;   // D6
@@ -114,6 +124,32 @@ bool sync_requested = false;
 Switch remix_sw;  
 bool remix_requested = false;
 
+// ------------------------------------------------------------------
+// Phase offset handling
+// ------------------------------------------------------------------
+bool phase_shift_active = false;
+
+void update_phase_offset() {
+    if (!loop_exists) return;
+    if (beats_per_loop <= 0) return;
+
+    // Compute number of stereo frames per beat (must be integer)
+    size_t beat_frames = loop_len / beats_per_loop;
+    if (beat_frames == 0) beat_frames = 1;
+
+    if (phase_shift_active) {
+        // Set left pointer one beat ahead of right
+        read_left = (read_right + beat_frames) % loop_len;
+    } else {
+        read_left = read_right;
+    }
+    // Optionally, also align fractional phases to avoid clicks
+    read_phase_left = read_phase_right;
+}
+
+// ------------------------------------------------------------------
+// MIDI clock functions
+// ------------------------------------------------------------------
 void update_clock_inc() {
     if (loop_exists && beats_per_loop > 0) {
         float samples_per_clock = (float)loop_len / (beats_per_loop * 24.0f);
@@ -135,15 +171,14 @@ void sendMIDIRealTime(uint8_t message) {
     midi.SendMessage(data, 1);
 }
 
-
 void update_beats_per_loop() {
     int new_beats = base_beats * multiplier;
-    // Clamp to a reasonable range, e.g., 1 to 32
     if (new_beats < 1) new_beats = 1;
     if (new_beats > 32) new_beats = 32;
     if (new_beats != beats_per_loop) {
         beats_per_loop = new_beats;
-        update_clock_inc();   // recalc MIDI clock
+        update_clock_inc();
+        update_phase_offset();   // re‑compute offset because beat length changed
     }
 }
 
@@ -181,7 +216,6 @@ const float FB_RAMP_TIME_MS = 10.0f;
 float fb_ramp_step;
 const float FB_ATTEN = 0.92f;
 
-
 // ------------------------------------------------------------------
 // Loop remixing function (called when remix button is pressed)
 // ------------------------------------------------------------------
@@ -190,16 +224,13 @@ void remix_loop() {
     if (beats_per_loop <= 0) return;
     if (loop_len % beats_per_loop != 0) return; // must be divisible
 
-    // Segment size in stereo samples (must be integer)
     size_t seg_samples = loop_len / beats_per_loop;
-    if (seg_samples < 2) return; // too small
+    if (seg_samples < 2) return;
 
-    // Create a list of segment indices
     size_t n = beats_per_loop;
     size_t indices[n];
     for (size_t i = 0; i < n; i++) indices[i] = i;
 
-    // Shuffle indices (Fisher-Yates)
     for (size_t i = n - 1; i > 0; i--) {
         size_t j = rand() % (i + 1);
         size_t tmp = indices[i];
@@ -207,14 +238,11 @@ void remix_loop() {
         indices[j] = tmp;
     }
 
-    // For each target segment, process source segment with a random effect
     for (size_t target = 0; target < n; target++) {
         size_t src = indices[target];
         size_t src_start = src * seg_samples;
         size_t dst_start = target * seg_samples;
-
-        // Choose effect (0 = normal, 1 = reverse, 2 = double speed, 3 = stutter)
-        int effect = rand() % 4;   // adjust as desired
+        int effect = rand() % 4;
 
         switch (effect) {
             case 0: // normal copy
@@ -225,7 +253,6 @@ void remix_loop() {
                     temp_buffer[dst_idx + 1] = loop_buffer[src_idx + 1];
                 }
                 break;
-
             case 1: // reverse
                 for (size_t j = 0; j < seg_samples; j++) {
                     size_t src_idx = (loop_start + src_start + (seg_samples - 1 - j)) % MAX_LOOP_LEN;
@@ -234,12 +261,8 @@ void remix_loop() {
                     temp_buffer[dst_idx + 1] = loop_buffer[src_idx + 1];
                 }
                 break;
-
-            case 2: // double speed (play twice in same time)
-                // compress to half length by taking every other sample, then repeat twice
-                // half_len = seg_samples / 2 (must be integer)
+            case 2: // double speed
                 if (seg_samples % 2 != 0) {
-                    // fallback to normal if odd length
                     for (size_t j = 0; j < seg_samples; j++) {
                         size_t src_idx = (loop_start + src_start + j) % MAX_LOOP_LEN;
                         size_t dst_idx = (loop_start + dst_start + j) % MAX_LOOP_LEN;
@@ -248,14 +271,12 @@ void remix_loop() {
                     }
                 } else {
                     size_t half = seg_samples / 2;
-                    // first half of output: compressed source (every other sample)
                     for (size_t j = 0; j < half; j++) {
                         size_t src_idx = (loop_start + src_start + j * 2) % MAX_LOOP_LEN;
                         size_t dst_idx = (loop_start + dst_start + j) % MAX_LOOP_LEN;
                         temp_buffer[dst_idx]     = loop_buffer[src_idx];
                         temp_buffer[dst_idx + 1] = loop_buffer[src_idx + 1];
                     }
-                    // second half: repeat the first half
                     for (size_t j = 0; j < half; j++) {
                         size_t dst_idx = (loop_start + dst_start + half + j) % MAX_LOOP_LEN;
                         size_t src_idx = (loop_start + dst_start + j) % MAX_LOOP_LEN;
@@ -264,11 +285,10 @@ void remix_loop() {
                     }
                 }
                 break;
-
-            case 3: // stutter: repeat first half twice (simple stutter)
+            case 3: // stutter
                 {
                     size_t half = seg_samples / 2;
-                    if (half == 0) half = seg_samples; // safety
+                    if (half == 0) half = seg_samples;
                     for (size_t j = 0; j < seg_samples; j++) {
                         size_t src_idx = (loop_start + src_start + (j % half)) % MAX_LOOP_LEN;
                         size_t dst_idx = (loop_start + dst_start + j) % MAX_LOOP_LEN;
@@ -280,16 +300,19 @@ void remix_loop() {
         }
     }
 
-    // Copy temporary buffer back to loop buffer
     for (size_t i = 0; i < loop_len; i++) {
         size_t phys = (loop_start + i) % MAX_LOOP_LEN;
         loop_buffer[phys]     = temp_buffer[phys];
         loop_buffer[phys + 1] = temp_buffer[phys + 1];
     }
 
-    // Reset playhead to start of loop for consistent sync
-    playhead = 0;
-    playhead_phase = 0.0f;
+    // Reset both read pointers and the write pointer to start of loop
+    read_left = 0;
+    read_right = 0;
+    write_pos = 0;
+    read_phase_left = 0.0f;
+    read_phase_right = 0.0f;
+    update_phase_offset();   // re‑apply offset if active
 }
 
 // ------------------------------------------------------------------
@@ -306,8 +329,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
     // Read pots
     pot_output_volume = hw.adc.GetFloat(0);
-    pot_fb_gain       = hw.adc.GetFloat(1) * 2.0f;   // 0..2 // would like to make this more intuitive....
-    pot_speed         = hw.adc.GetFloat(2); // TODO change this to a 5 position switch with some resistors (no code change but calculate it)
+    pot_fb_gain       = hw.adc.GetFloat(1) * 2.0f;
+    pot_speed         = hw.adc.GetFloat(2);
 
     // Map speed pot to speed magnitude (positive)
     float speed_mag;
@@ -317,7 +340,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     else if (pot_speed < 11.0f/12.0f) speed_mag = 1.5f;
     else                              speed_mag = 2.0f;
 
-    // Direction from switch
     bool reverse = rev_switch.Pressed();
     playhead_speed = reverse ? -speed_mag : speed_mag;
 
@@ -338,57 +360,62 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         float ext_raw_l = in[2][i];
         float ext_raw_r = in[3][i];
 
-        // --- Process external return (gain, filters, limiter, ramp) ---
+        // --- Process external return ---
         float gain_stage_l = ext_raw_l * pot_fb_gain;
         float gain_stage_r = ext_raw_r * pot_fb_gain;
-
         float limited_l = gain_stage_l;
         float limited_r = gain_stage_r;
         apply_limiter(limited_l, limited_r);
-
         float feedback_l = limited_l * fb_ramp_gain * FB_ATTEN;
         float feedback_r = limited_r * fb_ramp_gain * FB_ATTEN;
 
-        // --- Send current loop to external codec (always) ---
+        // --- Send current loop to external codec (stereo, using left/right pointers) ---
         if (loop_exists) {
-            size_t phys = (loop_start + playhead) % MAX_LOOP_LEN;
-            out[2][i] = loop_buffer[phys];
-            out[3][i] = loop_buffer[phys + 1];
+            size_t phys_left  = (loop_start + read_left * 2) % MAX_LOOP_LEN;
+            size_t phys_right = (loop_start + read_right * 2) % MAX_LOOP_LEN;
+            out[2][i] = loop_buffer[phys_left];       // left send
+            out[3][i] = loop_buffer[phys_right + 1]; // right send
         } else {
             out[2][i] = 0.0f;
             out[3][i] = 0.0f;
         }
 
-        // --- Read current loop sample (interpolated for variable speed) ---
-        float cur_l = 0.0f, cur_r = 0.0f;
+        // --- Read left channel loop sample (interpolated) ---
+        float cur_l = 0.0f;
         if (loop_exists) {
-            size_t phys = (loop_start + playhead) % MAX_LOOP_LEN;
+            size_t phys = (loop_start + read_left * 2) % MAX_LOOP_LEN;
             if (playhead_speed > 0.0f) {
-                // forward: interpolate between current and next sample
                 size_t next_phys = (phys + 2) % MAX_LOOP_LEN;
-                float s1_l = loop_buffer[phys];
-                float s1_r = loop_buffer[phys + 1];
-                float s2_l = loop_buffer[next_phys];
-                float s2_r = loop_buffer[next_phys + 1];
-                float frac = playhead_phase;
-                cur_l = s1_l + frac * (s2_l - s1_l);
-                cur_r = s1_r + frac * (s2_r - s1_r);
+                float s1 = loop_buffer[phys];
+                float s2 = loop_buffer[next_phys];
+                cur_l = s1 + read_phase_left * (s2 - s1);
             } else {
-                // reverse: interpolate between previous and current
                 size_t prev_phys = (phys + MAX_LOOP_LEN - 2) % MAX_LOOP_LEN;
-                float s1_l = loop_buffer[prev_phys];
-                float s1_r = loop_buffer[prev_phys + 1];
-                float s2_l = loop_buffer[phys];
-                float s2_r = loop_buffer[phys + 1];
-                float frac = playhead_phase;
-                cur_l = s1_l + frac * (s2_l - s1_l);
-                cur_r = s1_r + frac * (s2_r - s1_r);
+                float s1 = loop_buffer[prev_phys];
+                float s2 = loop_buffer[phys];
+                cur_l = s1 + read_phase_left * (s2 - s1);
             }
         }
 
-        // --- Determine what to write back ---
-        float write_l, write_r;
+        // --- Read right channel loop sample (interpolated) ---
+        float cur_r = 0.0f;
+        if (loop_exists) {
+            size_t phys = (loop_start + read_right * 2) % MAX_LOOP_LEN;
+            if (playhead_speed > 0.0f) {
+                size_t next_phys = (phys + 2) % MAX_LOOP_LEN;
+                float s1 = loop_buffer[phys + 1];
+                float s2 = loop_buffer[next_phys + 1];
+                cur_r = s1 + read_phase_right * (s2 - s1);
+            } else {
+                size_t prev_phys = (phys + MAX_LOOP_LEN - 2) % MAX_LOOP_LEN;
+                float s1 = loop_buffer[prev_phys + 1];
+                float s2 = loop_buffer[phys + 1];
+                cur_r = s1 + read_phase_right * (s2 - s1);
+            }
+        }
 
+        // --- Determine what to write back (using write_pos) ---
+        float write_l, write_r;
         if (current_mode == MODE_RECORD) {
             write_l = instr_l;
             write_r = instr_r;
@@ -417,11 +444,11 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             write_r = 0.0f;
         }
 
-        // --- Write to loop buffer ---
+        // --- Write to loop buffer (using write_pos) ---
         bool should_write = (current_mode == MODE_RECORD) ||
                             (loop_exists && (fb_write || current_mode == MODE_OVERDUB));
         if (should_write) {
-            size_t phys = (loop_start + playhead) % MAX_LOOP_LEN;
+            size_t phys = (loop_start + write_pos * 2) % MAX_LOOP_LEN;
             loop_buffer[phys]     = write_l;
             loop_buffer[phys + 1] = write_r;
         }
@@ -438,41 +465,51 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         out[0][i] = monitor_l * pot_output_volume;
         out[1][i] = monitor_r * pot_output_volume;
 
-        // --- Move playhead (variable speed) ---
-        if (current_mode == MODE_RECORD && !loop_exists) {
-            // First recording: always move forward at 1× to fill buffer linearly
-            playhead += 2;
-            if (playhead >= MAX_LOOP_LEN) playhead = 0;
-            playhead_phase = 0.0f;
-        } else if (loop_exists && current_mode != MODE_RECORD) {
-            // Playback or overdub: move according to speed/direction
-            playhead_phase += fabsf(playhead_speed);
-            while (playhead_phase >= 1.0f) {
-                playhead_phase -= 1.0f;
+        // --- Update read pointers (left and right independently) ---
+        if (loop_exists && current_mode != MODE_RECORD) {
+            // Left pointer
+            read_phase_left += fabsf(playhead_speed);
+            while (read_phase_left >= 1.0f) {
+                read_phase_left -= 1.0f;
                 if (playhead_speed > 0.0f) {
-                    playhead += 2;
-                    if (playhead >= (int)loop_len) playhead = 0;
+                    read_left = (read_left + 1) % loop_len;
                 } else {
-                    if (playhead >= 2) playhead -= 2;
-                    else playhead = (int)loop_len - 2;
+                    read_left = (read_left + loop_len - 1) % loop_len;
                 }
             }
-        } else if (current_mode == MODE_RECORD && loop_exists) {
-            // Overwriting an existing loop: move at selected speed
-            playhead_phase += fabsf(playhead_speed);
-            while (playhead_phase >= 1.0f) {
-                playhead_phase -= 1.0f;
+            // Right pointer
+            read_phase_right += fabsf(playhead_speed);
+            while (read_phase_right >= 1.0f) {
+                read_phase_right -= 1.0f;
                 if (playhead_speed > 0.0f) {
-                    playhead += 2;
-                    if (playhead >= (int)loop_len) playhead = 0;
+                    read_right = (read_right + 1) % loop_len;
                 } else {
-                    if (playhead >= 2) playhead -= 2;
-                    else playhead = (int)loop_len - 2;
+                    read_right = (read_right + loop_len - 1) % loop_len;
                 }
+            }
+        } else if (current_mode == MODE_RECORD) {
+            // During recording, align both read pointers to the write position
+            read_left = write_pos;
+            read_right = write_pos;
+            read_phase_left = 0.0f;
+            read_phase_right = 0.0f;
+        }
+
+        // --- Update write pointer ---
+        bool should_advance_write = (current_mode == MODE_RECORD) ||
+                                    (loop_exists && (fb_write || current_mode == MODE_OVERDUB));
+        if (should_advance_write) {
+            if (current_mode == MODE_RECORD && !loop_exists) {
+                // First recording: no wrap yet
+                write_pos++;
+                if (write_pos >= (MAX_LOOP_LEN / 2)) write_pos = 0;
+            } else {
+                write_pos++;
+                if (write_pos >= loop_len) write_pos = 0;
             }
         }
 
-        // --- MIDI Clock generation (unchanged) ---
+        // --- MIDI Clock generation ---
         if (send_clock && loop_exists) {
             clock_phase += clock_inc;
             while (clock_phase >= 1.0f) {
@@ -482,9 +519,14 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                 if (midi_clock_beat_counter >= 24) {
                     midi_clock_beat_counter = 0;
                     if (sync_requested) {
-                        playhead = 0;
-                        playhead_phase = 0.0f;
+                        // Sync: reset both read pointers and write pointer to start
+                        read_left = 0;
+                        read_right = 0;
+                        write_pos = 0;
+                        read_phase_left = 0.0f;
+                        read_phase_right = 0.0f;
                         sync_requested = false;
+                        update_phase_offset();   // re‑apply offset after reset
                     }
                     midi_led.Write(true);
                     led_timer = LED_BLINK_DURATION_SAMPLES;
@@ -516,7 +558,7 @@ int main(void)
     sync_sw.Init(seed::D6, sample_rate / 48.0f);
     remix_sw.Init(seed::D7, sample_rate / 48.0f);
 
-    // --- ADC for pots (A0, A1, A2) only; A3,A4 unused for now ---
+    // --- ADC for pots (A0, A1, A2) only; A3,A4 used for base beat selection (A3) ---
     AdcChannelConfig adc_config[5];
     adc_config[0].InitSingle(seed::A0);
     adc_config[1].InitSingle(seed::A1);
@@ -538,6 +580,7 @@ int main(void)
     fb_up.Init(seed::D2,     sample_rate / 48.0f);
     fb_down.Init(seed::D3,   sample_rate / 48.0f);
     rev_switch.Init(seed::D4, sample_rate / 48.0f);
+    phase_shift_sw.Init(seed::D14, sample_rate / 48.0f);
 
     beat_up_sw.Init(seed::D9, sample_rate / 48.0f);
     beat_down_sw.Init(seed::D10, sample_rate / 48.0f);
@@ -571,7 +614,7 @@ int main(void)
 
     hw.StartAudio(AudioCallback);
 
-    // --- Main loop: record handling and ramp target ---
+    // --- Main loop ---
     bool was_recording = false;
     FeedbackState last_fb_state = FB_OFF;
 
@@ -581,13 +624,14 @@ int main(void)
         fb_up.Debounce();
         fb_down.Debounce();
         rev_switch.Debounce();
+        phase_shift_sw.Debounce();
 
         beat_up_sw.Debounce();
         beat_down_sw.Debounce();
 
         if (beat_up_sw.RisingEdge()) {
             int new_mult = multiplier * 2;
-            if (new_mult <= 64) {          
+            if (new_mult <= 64) {
                 multiplier = new_mult;
                 update_beats_per_loop();
             }
@@ -600,15 +644,23 @@ int main(void)
             }
         }
 
-        float v = hw.adc.GetFloat(3);   // 0..1 corresponds to 0..3.3V
-        int new_base = 4;               // default
-        if (v < 0.2f) new_base = 3;     // near 0V
-        else if (v > 0.8f) new_base = 5; // near 3.3V
-        else new_base = 4;               // middle voltage
+        // Read base beats from A3 (switch)
+        float v = hw.adc.GetFloat(3);
+        int new_base = 4;
+        if (v < 0.2f) new_base = 3;
+        else if (v > 0.8f) new_base = 5;
+        else new_base = 4;
         if (new_base != base_beats) {
             base_beats = new_base;
-            multiplier = 1;               // reset multiplier when base changes
+            multiplier = 1;
             update_beats_per_loop();
+        }
+
+        // Phase shift switch handling
+        bool new_phase_state = phase_shift_sw.Pressed();
+        if (new_phase_state != phase_shift_active) {
+            phase_shift_active = new_phase_state;
+            update_phase_offset();
         }
 
         FeedbackState fb_state = get_fb_state();
@@ -618,15 +670,11 @@ int main(void)
         }
 
         sync_sw.Debounce();
-        if (sync_sw.RisingEdge()) {      // when pressed and released (or just pressed)
+        if (sync_sw.RisingEdge()) {
             sync_requested = true;
         }
 
         remix_sw.Debounce();
-        if (remix_sw.RisingEdge()) {
-            remix_requested = true;
-        }
-
         if (remix_sw.RisingEdge()) {
             if (loop_exists && get_mode() != MODE_RECORD) {
                 remix_loop();
@@ -638,14 +686,17 @@ int main(void)
         // Entering record mode
         if (current_mode == MODE_RECORD && !was_recording) {
             if (loop_exists) {
-                size_t current_phys = (loop_start + playhead) % MAX_LOOP_LEN;
+                size_t current_phys = (loop_start + write_pos * 2) % MAX_LOOP_LEN;
                 loop_start = current_phys;
                 sendMIDIRealTime(0xFC);
             } else {
                 loop_start = 0;
             }
-            playhead = 0;
-            playhead_phase = 0.0f;
+            write_pos = 0;
+            read_left = 0;
+            read_right = 0;
+            read_phase_left = 0.0f;
+            read_phase_right = 0.0f;
             loop_len = 0;
             loop_exists = false;
             was_recording = true;
@@ -654,12 +705,16 @@ int main(void)
 
         // Leaving record mode
         if (was_recording && current_mode != MODE_RECORD) {
-            loop_len = playhead;
+            loop_len = write_pos;
             if (loop_len >= 4) {
                 loop_exists = true;
-                playhead = 0;
-                playhead_phase = 0.0f;
+                write_pos = 0;
+                read_left = 0;
+                read_right = 0;
+                read_phase_left = 0.0f;
+                read_phase_right = 0.0f;
                 update_clock_inc();
+                update_phase_offset();   // apply offset if active
                 if (!sent_start) {
                     sendMIDIRealTime(0xFA);
                     sent_start = true;
