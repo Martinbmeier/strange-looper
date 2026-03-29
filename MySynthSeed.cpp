@@ -60,11 +60,15 @@ float playhead_speed = 1.0f;   // signed, same for both channels
 // ------------------------------------------------------------------
 MidiUartHandler midi;
 
-Switch mode_up, mode_down;   // D0, D1
-Switch fb_up, fb_down;       // D2, D3
-Switch rev_switch;           // D4
-Switch phase_shift_sw;       // D14
-Switch replace_sw;        // D12 TODO - not implemented yet, which switch?
+Switch mode_up, mode_down;   // pins D0, D1
+Switch fb_up, fb_down;       // pins D2, D3
+Switch rev_switch;           // pin D4
+Switch sync_sw;              // pin D6
+Switch remix_sw;             // pin D7
+Switch beat_up_sw, beat_down_sw;   // pins D9, D10
+Switch replace_sw;           // pin D12
+Switch phase_shift_sw;       // pin D14
+
 bool replace_active = false;
 
 enum Mode { MODE_RECORD, MODE_IDLE, MODE_OVERDUB };
@@ -98,9 +102,7 @@ int multiplier = 1;
 int beats_per_loop = base_beats * multiplier;
 bool send_clock = false;
 bool sent_start = false;
-Switch beat_up_sw, beat_down_sw;   // D9, D10
-Switch sync_sw;                     // D6
-Switch remix_sw;                    // D7
+
 bool sync_requested = false;
 bool remix_requested = false;
 
