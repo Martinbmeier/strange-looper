@@ -33,10 +33,9 @@ DaisySeed hw;
 // Buffer definitions – two mono buffers in SDRAM
 // ------------------------------------------------------------------
 #define MAX_LOOP_LEN (48000 * 60)          // 60 seconds mono at 48kHz (stereo would be double)
-float DSY_SDRAM_BSS left_buffer[MAX_LOOP_LEN];
-float DSY_SDRAM_BSS right_buffer[MAX_LOOP_LEN];
-float DSY_SDRAM_BSS temp_left[MAX_LOOP_LEN];
-float DSY_SDRAM_BSS temp_right[MAX_LOOP_LEN];
+float DSY_SDRAM_BSS buffer[2][2][MAX_LOOP_LEN]; // [pair][channel][sample]
+// pair 0 = Buffer1, pair 1 = Buffer2
+// channel 0 = left, channel 1 = right
 
 size_t left_len = 0, right_len = 0;
 bool loop_exists = false;   // true if both buffers have content
@@ -63,13 +62,17 @@ MidiUartHandler midi;
 Switch mode_up, mode_down;   // pins D0, D1
 Switch fb_up, fb_down;       // pins D2, D3
 Switch rev_switch;           // pin D4
-Switch sync_sw;              // pin D6
+Switch sync_sw;              // pin D30
 Switch remix_sw;             // pin D7
 Switch beat_up_sw, beat_down_sw;   // pins D9, D10
-Switch replace_sw;           // pin D12
+Switch replace_sw;           // pin D6
 Switch phase_shift_sw;       // pin D14
+Switch buffer_select_sw;     // pin D5
 
 bool replace_active = false;
+float pot_crossfade = 0.0f;
+bool buffer_selected = false;   // false = Buffer1, true = Buffer2
+float crossfade_gain = 0.0f;    // 0.0 = full Buffer1, 1.0 = full Buffer2
 
 enum Mode { MODE_RECORD, MODE_IDLE, MODE_OVERDUB };
 Mode get_mode() {
@@ -180,6 +183,10 @@ void remix_loop() {
     size_t seg_samples = right_len / beats_per_loop;
     if (seg_samples < 2) return;
 
+    // Determine source and destination buffer pairs
+    int src_buf = buffer_selected ? 1 : 0;          // selected buffer (where recording/overdub goes)
+    int dst_buf = 1 - src_buf;                     // the other buffer (where remix result will be written)
+
     size_t n = beats_per_loop;
     size_t indices[n];
     for (size_t i = 0; i < n; i++) indices[i] = i;
@@ -196,7 +203,7 @@ void remix_loop() {
         size_t dst_start = target * seg_samples;
         int effect = rand() % 4;
 
-        // Apply same effect to both buffers
+        // Apply same effect to both channels
         for (size_t j = 0; j < seg_samples; j++) {
             size_t src_idx = src_start + j;
             size_t dst_idx = dst_start + j;
@@ -204,27 +211,24 @@ void remix_loop() {
 
             switch (effect) {
                 case 0: // normal copy
-                    s_left = left_buffer[src_idx];
-                    s_right = right_buffer[src_idx];
+                    s_left = buffer[src_buf][0][src_idx];
+                    s_right = buffer[src_buf][1][src_idx];
                     break;
                 case 1: // reverse
-                    s_left = left_buffer[src_start + (seg_samples - 1 - j)];
-                    s_right = right_buffer[src_start + (seg_samples - 1 - j)];
+                    s_left = buffer[src_buf][0][src_start + (seg_samples - 1 - j)];
+                    s_right = buffer[src_buf][1][src_start + (seg_samples - 1 - j)];
                     break;
                 case 2: // double speed
                     if (seg_samples % 2 != 0) {
-                        s_left = left_buffer[src_idx];
-                        s_right = right_buffer[src_idx];
+                        // odd segment length: fallback to normal copy
+                        s_left = buffer[src_buf][0][src_idx];
+                        s_right = buffer[src_buf][1][src_idx];
                     } else {
                         size_t half = seg_samples / 2;
-                        if (j < half) {
-                            s_left = left_buffer[src_start + j * 2];
-                            s_right = right_buffer[src_start + j * 2];
-                        } else {
-                            // repeat first half
-                            s_left = temp_left[dst_start + (j - half)];
-                            s_right = temp_right[dst_start + (j - half)];
-                        }
+                        // For both halves we read from source at double stride
+                        size_t src_sample = src_start + (j % half) * 2;
+                        s_left = buffer[src_buf][0][src_sample];
+                        s_right = buffer[src_buf][1][src_sample];
                     }
                     break;
                 case 3: // stutter
@@ -232,29 +236,19 @@ void remix_loop() {
                         size_t half = seg_samples / 2;
                         if (half == 0) half = seg_samples;
                         size_t rep = j % half;
-                        s_left = left_buffer[src_start + rep];
-                        s_right = right_buffer[src_start + rep];
+                        s_left = buffer[src_buf][0][src_start + rep];
+                        s_right = buffer[src_buf][1][src_start + rep];
                     }
                     break;
             }
-            temp_left[dst_idx] = s_left;
-            temp_right[dst_idx] = s_right;
+            // Write directly to destination buffer
+            buffer[dst_buf][0][dst_idx] = s_left;
+            buffer[dst_buf][1][dst_idx] = s_right;
         }
     }
 
-    // Copy back to main buffers
-    for (size_t i = 0; i < right_len; i++) {
-        left_buffer[i] = temp_left[i];
-        right_buffer[i] = temp_right[i];
-    }
-
-    // Reset pointers
-    read_left = 0;
-    read_right = 0;
-    write_left = 0;
-    write_right = 0;
-    read_phase_left = 0.0f;
-    read_phase_right = 0.0f;
+    // Request sync on next beat boundary to keep loop in time
+    sync_requested = true;
 }
 
 // ------------------------------------------------------------------
@@ -299,6 +293,9 @@ void AudioCallback(AudioHandle::InputBuffer in,
     pot_output_volume = hw.adc.GetFloat(0);
     pot_fb_gain       = hw.adc.GetFloat(1) * 2.0f;
     pot_speed         = hw.adc.GetFloat(2);
+    pot_crossfade     = hw.adc.GetFloat(4);
+    crossfade_gain    = pot_crossfade; // linear 0..1
+    int write_buf = buffer_selected ? 1 : 0;
 
     // Map speed pot to speed magnitude (positive)
     float speed_mag;
@@ -342,8 +339,12 @@ void AudioCallback(AudioHandle::InputBuffer in,
 
         // --- Send current loop to external codec (using read pointer) ---
         if (loop_exists) {
-            out[2][i] = left_buffer[read_left];
-            out[3][i] = right_buffer[read_right];
+            float left0 = buffer[0][0][read_left];
+            float left1 = buffer[1][0][read_left];
+            out[2][i] = (1.0f - crossfade_gain) * left0 + crossfade_gain * left1;
+            float right0 = buffer[0][1][read_right];
+            float right1 = buffer[1][1][read_right];
+            out[3][i] = (1.0f - crossfade_gain) * right0 + crossfade_gain * right1;
         } else {
             out[2][i] = 0.0f;
             out[3][i] = 0.0f;
@@ -354,9 +355,13 @@ void AudioCallback(AudioHandle::InputBuffer in,
         if (loop_exists && left_len > 0) {
             size_t idx1 = read_left;
             size_t idx2 = (read_left + 1) % left_len;
-            float s1 = left_buffer[idx1];
-            float s2 = left_buffer[idx2];
-            loop_l = s1 + read_phase_left * (s2 - s1);
+            float s1_0 = buffer[0][0][idx1];
+            float s2_0 = buffer[0][0][idx2];
+            float loop_l0 = s1_0 + read_phase_left * (s2_0 - s1_0);
+            float s1_1 = buffer[1][0][idx1];
+            float s2_1 = buffer[1][0][idx2];
+            float loop_l1 = s1_1 + read_phase_left * (s2_1 - s1_1);
+            loop_l = (1.0f - crossfade_gain) * loop_l0 + crossfade_gain * loop_l1;
         }
 
         // --- Read right channel (playback) ---
@@ -364,9 +369,13 @@ void AudioCallback(AudioHandle::InputBuffer in,
         if (loop_exists && right_len > 0) {
             size_t idx1 = read_right;
             size_t idx2 = (read_right + 1) % right_len;
-            float s1 = right_buffer[idx1];
-            float s2 = right_buffer[idx2];
-            loop_r = s1 + read_phase_right * (s2 - s1);
+            float s1_0 = buffer[0][1][idx1];
+            float s2_0 = buffer[0][1][idx2];
+            float loop_r0 = s1_0 + read_phase_right * (s2_0 - s1_0);
+            float s1_1 = buffer[1][1][idx1];
+            float s2_1 = buffer[1][1][idx2];
+            float loop_r1 = s1_1 + read_phase_right * (s2_1 - s1_1);
+            loop_r = (1.0f - crossfade_gain) * loop_r0 + crossfade_gain * loop_r1;
         }
 
         // --- Determine new material to record ---
@@ -390,7 +399,9 @@ void AudioCallback(AudioHandle::InputBuffer in,
             // if (fabsf(new_l) > 1e-6f || fabsf(new_r) > 1e-6f) {
             //     do_write = true;
             // }
-        } else if (loop_exists && current_mode == MODE_OVERDUB) {
+            do_write = true;
+        }
+        else if (loop_exists && current_mode == MODE_OVERDUB) {
             // Overdub: add new material (instrument + optional feedback) to existing buffer
             new_l = instr_l;
             new_r = instr_r;
@@ -406,25 +417,27 @@ void AudioCallback(AudioHandle::InputBuffer in,
 
         // --- Write to buffer if needed ---
         if (do_write) {
-            // Read current value at write position
-            float cur_left = left_buffer[write_left];
-            float cur_right = right_buffer[write_right];
+            // Read current value at write position from selected buffer
+            float cur_left = buffer[write_buf][0][write_left];
+            float cur_right = buffer[write_buf][1][write_right];
 
             if (current_mode == MODE_RECORD) {
                 // Overwrite
-                left_buffer[write_left] = new_l;
-                right_buffer[write_right] = new_r;
+                buffer[write_buf][0][write_left] = new_l;
+                buffer[write_buf][1][write_right] = new_r;
             } else if (replace_active && loop_exists) {
                 // Replace mode: overwrite with new material
-                left_buffer[write_left] = new_l;
-                right_buffer[write_right] = new_r;
+                buffer[write_buf][0][write_left] = new_l;
+                buffer[write_buf][1][write_right] = new_r;
             } else if (loop_exists && current_mode == MODE_OVERDUB) {
                 // Normal overdub: add new material to existing loop
-                left_buffer[write_left] = cur_left + new_l;
-                right_buffer[write_right] = cur_right + new_r;
+                float new_left = cur_left + new_l;
+                float new_right = cur_right + new_r;
                 // Soft clip
-                left_buffer[write_left] = left_buffer[write_left] > 1.0f ? 1.0f : (left_buffer[write_left] < -1.0f ? -1.0f : left_buffer[write_left]);
-                right_buffer[write_right] = right_buffer[write_right] > 1.0f ? 1.0f : (right_buffer[write_right] < -1.0f ? -1.0f : right_buffer[write_right]);
+                new_left = new_left > 1.0f ? 1.0f : (new_left < -1.0f ? -1.0f : new_left);
+                new_right = new_right > 1.0f ? 1.0f : (new_right < -1.0f ? -1.0f : new_right);
+                buffer[write_buf][0][write_left] = new_left;
+                buffer[write_buf][1][write_right] = new_right;
             }
         }
 
@@ -571,9 +584,9 @@ int main(void)
     //midi_led.Init(seed::D5, GPIO::Mode::OUTPUT);
     //midi_led.Write(false);
 
-    sync_sw.Init(seed::D6, sample_rate / 48.0f);
+    sync_sw.Init(seed::D30, sample_rate / 48.0f);
     remix_sw.Init(seed::D7, sample_rate / 48.0f);
-    replace_sw.Init(seed::D30, sample_rate / 48.0f);
+    replace_sw.Init(seed::D6, sample_rate / 48.0f);
 
     // ADC
     AdcChannelConfig adc_config[5];
@@ -598,6 +611,7 @@ int main(void)
     fb_down.Init(seed::D3, sample_rate / 48.0f);
     rev_switch.Init(seed::D4, sample_rate / 48.0f);
     phase_shift_sw.Init(seed::D14, sample_rate / 48.0f);
+    buffer_select_sw.Init(seed::D5, sample_rate / 48.0f);
 
     beat_up_sw.Init(seed::D9, sample_rate / 48.0f);
     beat_down_sw.Init(seed::D10, sample_rate / 48.0f);
@@ -628,8 +642,10 @@ int main(void)
 
     // Clear buffers
     for (size_t i = 0; i < MAX_LOOP_LEN; i++) {
-        left_buffer[i] = 0.0f;
-        right_buffer[i] = 0.0f;
+        buffer[0][0][i] = 0.0f;
+        buffer[0][1][i] = 0.0f;
+        buffer[1][0][i] = 0.0f;
+        buffer[1][1][i] = 0.0f;
     }
 
     hw.StartAudio(AudioCallback);
@@ -645,12 +661,14 @@ int main(void)
         fb_down.Debounce();
         rev_switch.Debounce();
         phase_shift_sw.Debounce();
+        buffer_select_sw.Debounce();
 
         beat_up_sw.Debounce();
         beat_down_sw.Debounce();
 
         replace_sw.Debounce();
         replace_active = replace_sw.Pressed();   // true while button held
+        buffer_selected = buffer_select_sw.Pressed();
         if (replace_sw.RisingEdge() && loop_exists) {
             // Align write pointers to read pointers for immediate replacement
             write_left = read_left;
@@ -739,6 +757,13 @@ int main(void)
             left_len = 0;
             right_len = 0;
             loop_exists = false;
+            // Clear both buffer pairs (user decision: clear both, record into selected pair)
+            for (size_t i = 0; i < MAX_LOOP_LEN; i++) {
+                buffer[0][0][i] = 0.0f;
+                buffer[0][1][i] = 0.0f;
+                buffer[1][0][i] = 0.0f;
+                buffer[1][1][i] = 0.0f;
+            }
             was_recording = true;
             sent_start = false;
             sendMIDIRealTime(0xFC);
