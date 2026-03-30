@@ -106,6 +106,7 @@ graph TD
 - **Phase Shift**: Toggle **Phase Shift** (D14) to shorten the left loop by one beat. The offset accumulates each pass, creating evolving rhythms.
 - **Remix**: Press **Remix** (D7) to randomly rearrange the current loop’s beat segments.
 - **Sync**: Press **Sync** (D6) to reset playback to the start of the loop.
+- **Replace**: Hold **Replace** (D30) to overwrite the loop with incoming audio, independent of the overdub switch. Works in any mode (Idle, Overdub, Record).
 - **Beat Length**: Adjust the **Beat Length** pot (A3) to set the base number of beats (3, 4, or 5). Use **Beat Up/Down** (D9/D10) to multiply the length (1×–64×).
 - **MIDI Clock**: The Daisy Seed sends MIDI clock messages (24 ppq) while a loop is active. Connect a MIDI output to synchronize external gear.
 
@@ -120,7 +121,6 @@ If a NeoPixel ring is connected to D5, the firmware includes a startup animation
 
 ## Known Issues / TODOs
 
-- Replace switch (D30) is not fully implemented.
 - NeoPixel support is compiled but disabled by default.
 - External codec configuration may need adjustment for different hardware.
 

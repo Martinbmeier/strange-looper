@@ -378,6 +378,18 @@ void AudioCallback(AudioHandle::InputBuffer in,
             new_l = instr_l;
             new_r = instr_r;
             do_write = true;
+        } else if (loop_exists && replace_active) {
+            // Replace: overwrite with instrument input (+ optional feedback)
+            new_l = instr_l;
+            new_r = instr_r;
+            // if (fb_write) { // in replace mode the feedback is also replaced, perhaps, like a feedback loop inturrupt
+            //     new_l += feedback_l;
+            //     new_r += feedback_r;
+            // }
+            // Only write if there is any new material (prevents writing silence over the loop) // not sure If I want this gate, replaceing the loop with silence acts as a momentary erase tool
+            // if (fabsf(new_l) > 1e-6f || fabsf(new_r) > 1e-6f) {
+            //     do_write = true;
+            // }
         } else if (loop_exists && current_mode == MODE_OVERDUB) {
             // Overdub: add new material (instrument + optional feedback) to existing buffer
             new_l = instr_l;
@@ -402,19 +414,17 @@ void AudioCallback(AudioHandle::InputBuffer in,
                 // Overwrite
                 left_buffer[write_left] = new_l;
                 right_buffer[write_right] = new_r;
+            } else if (replace_active && loop_exists) {
+                // Replace mode: overwrite with new material
+                left_buffer[write_left] = new_l;
+                right_buffer[write_right] = new_r;
             } else if (loop_exists && current_mode == MODE_OVERDUB) {
-                if (replace_active) {
-                    // Replace mode: overwrite with new material
-                    left_buffer[write_left] = new_l;
-                    right_buffer[write_right] = new_r;
-                } else {
-                    // Normal overdub: add new material to existing loop
-                    left_buffer[write_left] = cur_left + new_l;
-                    right_buffer[write_right] = cur_right + new_r;
-                    // Soft clip
-                    left_buffer[write_left] = left_buffer[write_left] > 1.0f ? 1.0f : (left_buffer[write_left] < -1.0f ? -1.0f : left_buffer[write_left]);
-                    right_buffer[write_right] = right_buffer[write_right] > 1.0f ? 1.0f : (right_buffer[write_right] < -1.0f ? -1.0f : right_buffer[write_right]);
-                }
+                // Normal overdub: add new material to existing loop
+                left_buffer[write_left] = cur_left + new_l;
+                right_buffer[write_right] = cur_right + new_r;
+                // Soft clip
+                left_buffer[write_left] = left_buffer[write_left] > 1.0f ? 1.0f : (left_buffer[write_left] < -1.0f ? -1.0f : left_buffer[write_left]);
+                right_buffer[write_right] = right_buffer[write_right] > 1.0f ? 1.0f : (right_buffer[write_right] < -1.0f ? -1.0f : right_buffer[write_right]);
             }
         }
 
@@ -461,7 +471,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         }
 
         // --- Update write pointers (tape moves at write_speed, always) ---
-        if (current_mode == MODE_RECORD || (loop_exists && current_mode == MODE_OVERDUB)) {
+        if (current_mode == MODE_RECORD || (loop_exists && (current_mode == MODE_OVERDUB || replace_active))) {
             write_phase_left += write_speed;
             while (write_phase_left >= 1.0f) {
                 write_phase_left -= 1.0f;
@@ -563,7 +573,7 @@ int main(void)
 
     sync_sw.Init(seed::D6, sample_rate / 48.0f);
     remix_sw.Init(seed::D7, sample_rate / 48.0f);
-    replace_sw.Init(seed::D30, sample_rate / 48.0f); // TODO - not implemented yet, which switch?
+    replace_sw.Init(seed::D30, sample_rate / 48.0f);
 
     // ADC
     AdcChannelConfig adc_config[5];
@@ -641,6 +651,13 @@ int main(void)
 
         replace_sw.Debounce();
         replace_active = replace_sw.Pressed();   // true while button held
+        if (replace_sw.RisingEdge() && loop_exists) {
+            // Align write pointers to read pointers for immediate replacement
+            write_left = read_left;
+            write_right = read_right;
+            write_phase_left = read_phase_left;
+            write_phase_right = read_phase_right;
+        }
 
         static Mode prev_mode = MODE_IDLE;
         Mode current_mode = get_mode();
