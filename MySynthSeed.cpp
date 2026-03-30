@@ -1,9 +1,15 @@
 /**
- * Looper with accumulating phase shift (left loop shorter by one beat)
- * - Two independent mono buffers in SDRAM
+ * Looper with mode for accumulating phase shift (left loop shorter by one beat)
+ * - Two independent sets of mono buffers in SDRAM
  * - Speed, reverse, feedback, MIDI clock, remix, sync buttons all work
  * - Phase shift switch (D11): when on, left loop is one beat shorter than right
  * - Offset accumulates each loop pass; eventually realigns
+ * - Sync switch (D30): when pressed, next loop pass will realign to 0 phase
+ * - Replace switch (D6): when on, new recording replaces existing loop instead of overdubbing
+ * - Remix switch (D7): when on, "remix" effects are engaged TODO: make more remix effects, 12 options with multi switch
+ * - Beat up/down switches (D9, D10): make three options in total, 3, 4, 5 beats per loop (then can be multiplied)
+ * - Buffer select switch (D5): select which buffer pair to record into (default Buffer1)
+ * - MIDI clock sync: loop length is quantized to MIDI clock, sync button realigns playheads/read heads to clock
  */
 
 #include "daisy_seed.h"
@@ -382,23 +388,10 @@ void AudioCallback(AudioHandle::InputBuffer in,
         float new_l = 0.0f, new_r = 0.0f;
         bool do_write = false;
 
-        if (current_mode == MODE_RECORD) {
-            // Record: overwrite with instrument input
+        if (current_mode == MODE_RECORD || (loop_exists && replace_active)) {
+            // Record or replace: overwrite with instrument input
             new_l = instr_l;
             new_r = instr_r;
-            do_write = true;
-        } else if (loop_exists && replace_active) {
-            // Replace: overwrite with instrument input (+ optional feedback)
-            new_l = instr_l;
-            new_r = instr_r;
-            // if (fb_write) { // in replace mode the feedback is also replaced, perhaps, like a feedback loop inturrupt
-            //     new_l += feedback_l;
-            //     new_r += feedback_r;
-            // }
-            // Only write if there is any new material (prevents writing silence over the loop) // not sure If I want this gate, replaceing the loop with silence acts as a momentary erase tool
-            // if (fabsf(new_l) > 1e-6f || fabsf(new_r) > 1e-6f) {
-            //     do_write = true;
-            // }
             do_write = true;
         }
         else if (loop_exists && current_mode == MODE_OVERDUB) {
@@ -421,12 +414,8 @@ void AudioCallback(AudioHandle::InputBuffer in,
             float cur_left = buffer[write_buf][0][write_left];
             float cur_right = buffer[write_buf][1][write_right];
 
-            if (current_mode == MODE_RECORD) {
-                // Overwrite
-                buffer[write_buf][0][write_left] = new_l;
-                buffer[write_buf][1][write_right] = new_r;
-            } else if (replace_active && loop_exists) {
-                // Replace mode: overwrite with new material
+            if (current_mode == MODE_RECORD || (replace_active && loop_exists)) {
+                // Overwrite (record or replace)
                 buffer[write_buf][0][write_left] = new_l;
                 buffer[write_buf][1][write_right] = new_r;
             } else if (loop_exists && current_mode == MODE_OVERDUB) {
