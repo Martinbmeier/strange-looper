@@ -14,26 +14,12 @@
 
 #include "daisy_seed.h"
 #include "daisysp.h"
-// #include "arduino_compat.h"
-// #include "Adafruit_NeoPixel.h"
 #include <cstdlib>
 
 using namespace daisy;
 using namespace daisysp;
 
 DaisySeed hw;
-// GPIO neo_pixel_pin;
-
-// #define PIN_NEOPIXEL 5
-// #define NUMPIXELS 24
-
-// Color order: common strips are GRB (WS2812B) or RGB (WS2811).
-// Try NEO_GRB if colors appear swapped (e.g., red shows as green).
-// #define NEOPIXEL_ORDER NEO_RGB
-
-// The constructor takes the data pin, number of LEDs, and a color order flag.
-// Adafruit_NeoPixel ring(NUMPIXELS, PIN_NEOPIXEL, NEOPIXEL_ORDER + NEO_KHZ800);
-// uint8_t led_buffer[NUMPIXELS * 3]; 
 
 // ------------------------------------------------------------------
 // Buffer definitions – two mono buffers in SDRAM
@@ -528,44 +514,6 @@ int main(void)
     hw.Init();
     sample_rate = hw.AudioSampleRate();
     srand(System::GetNow());
-
-    // neo_pixel_pin.Init(daisy::seed::D5, GPIO::Mode::OUTPUT);
-    // ring.begin();
-    // ring.clear();
-    // ring.show();
-
-    // // Animated LED test
-    // // 1. Moving red dot
-    // for (int i = 0; i < NUMPIXELS; i++) {
-    //     ring.setPixelColor(i, ring.Color(255, 0, 0)); // red
-    //     ring.show();
-    //     System::Delay(50);
-    //     ring.setPixelColor(i, ring.Color(0, 0, 0)); // off
-    // }
-    // // 2. Moving green dot
-    // for (int i = 0; i < NUMPIXELS; i++) {
-    //     ring.setPixelColor(i, ring.Color(0, 255, 0)); // green
-    //     ring.show();
-    //     System::Delay(50);
-    //     ring.setPixelColor(i, ring.Color(0, 0, 0));
-    // }
-    // // 3. Moving blue dot
-    // for (int i = 0; i < NUMPIXELS; i++) {
-    //     ring.setPixelColor(i, ring.Color(0, 0, 255)); // blue
-    //     ring.show();
-    //     System::Delay(50);
-    //     ring.setPixelColor(i, ring.Color(0, 0, 0));
-    // }
-    // // 4. Fill with white gradually
-    // for (int i = 0; i < NUMPIXELS; i++) {
-    //     ring.setPixelColor(i, ring.Color(64, 64, 64)); // dim white
-    //     ring.show();
-    //     System::Delay(30);
-    // }
-    // // 5. Clear
-    // ring.clear();
-    // ring.show();
-    // System::Delay(500);
 
     // MIDI
     MidiUartHandler::Config midi_config;
