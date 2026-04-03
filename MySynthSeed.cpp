@@ -53,6 +53,21 @@ float playhead_speed = 1.0f;   // signed, same for both channels
 // MIDI, switches, etc. (unchanged)
 // ------------------------------------------------------------------
 MidiUartHandler midi;
+I2CHandle i2c;
+
+// Neopixel LED ring state
+uint8_t ledFrame[72];
+uint32_t ledUpdateCounter = 0;
+const uint32_t ledUpdateInterval = 1600; // 48kHz / 30Hz
+
+// Quarter-note flash animation
+bool flashActive = false;
+uint8_t flashBrightness = 0;
+const uint8_t flashDecay = 16; // per frame
+
+// Background pulse for mode (record/overdub/feedback)
+float pulsePhase = 0.0f;
+const float pulseInc = 0.02f; // adjust for speed
 
 Switch mode_up, mode_down;   // pins D0, D1
 Switch fb_up, fb_down;       // pins D2, D3
@@ -79,6 +94,8 @@ size_t base_len_left = 0, base_len_right = 0;
 
 void update_phase_shift();
 void update_clock_inc();
+void sendLEDFrame(uint8_t rgb[72]);
+void computeLEDFrame(uint8_t rgb[72]);
 
 enum Mode { MODE_RECORD, MODE_IDLE, MODE_OVERDUB };
 Mode get_mode() {
@@ -136,6 +153,111 @@ void update_clock_inc() {
 void sendMIDIRealTime(uint8_t msg) {
     uint8_t data[1] = { msg };
     midi.SendMessage(data, 1);
+}
+
+void sendLEDFrame(uint8_t rgb[72]) {
+    uint8_t data[73];
+    data[0] = 0xFF; // batch command
+    for (int i = 0; i < 72; i++) {
+        data[i + 1] = rgb[i];
+    }
+    i2c.TransmitBlocking(0x26, data, 73, 10); // 10 ms timeout
+}
+
+// Helper: add with saturation (cap at 255)
+static inline uint8_t add_clamp(uint8_t a, uint8_t b) {
+    int sum = a + b;
+    return sum > 255 ? 255 : sum;
+}
+
+void computeLEDFrame(uint8_t rgb[72]) {
+    memset(rgb, 0, 72);
+    
+    // Get current mode
+    Mode mode = get_mode();
+    FeedbackState fb = get_fb_state();
+    bool recording = (mode == MODE_RECORD);
+    bool overdubbing = (mode == MODE_OVERDUB);
+    bool feedbackRecord = (fb == FB_RECORD);
+    
+    // Update global pulse phase (called each frame)
+    pulsePhase += pulseInc;
+    if (pulsePhase > 6.283185f) pulsePhase -= 6.283185f; // 2*PI
+    float pulseBrightness = 0.3f + 0.2f * sinf(pulsePhase); // 0.1-0.5
+    
+    // Determine base color for background effect
+    uint8_t bg_r = 0, bg_g = 0, bg_b = 0;
+    if (recording) {
+        bg_r = 50; // dim red
+    } else if (overdubbing && !feedbackRecord) {
+        bg_r = 30; bg_g = 30; // yellow (mix)
+    } else if (feedbackRecord) {
+        bg_r = 30; bg_b = 30; // purple
+    }
+    
+    // Apply background pulse to all LEDs (except where foreground overrides)
+    for (int i = 0; i < 24; i++) {
+        rgb[i*3]   = (uint8_t)(bg_r * pulseBrightness);
+        rgb[i*3+1] = (uint8_t)(bg_g * pulseBrightness);
+        rgb[i*3+2] = (uint8_t)(bg_b * pulseBrightness);
+    }
+    
+    // Buffer fill progress bar (red)
+    if (recording || multiply_enabled) {
+        int fillLEDs;
+        if (recording) {
+            // fill based on write_right relative to MAX_LOOP_LEN
+            fillLEDs = (write_right * 24) / MAX_LOOP_LEN;
+            // blinking warning in last quarter
+            if (write_right > (MAX_LOOP_LEN * 3 / 4)) {
+                // blink at 0.5 Hz (every 2 seconds) using pulse phase
+                if ((int)(pulsePhase * 10) % 20 < 10) {
+                    // bright red
+                    for (int i = 0; i < fillLEDs; i++) {
+                        rgb[i*3] = 255;
+                        rgb[i*3+1] = 0;
+                        rgb[i*3+2] = 0;
+                    }
+                } else {
+                    // keep dim red background (already set)
+                }
+            } else {
+                // solid red at low brightness (overwrite background)
+                for (int i = 0; i < fillLEDs; i++) {
+                    rgb[i*3] = 100;
+                }
+            }
+        } else {
+            // multiply mode: fill based on current loop length vs max
+            fillLEDs = (right_len * 24) / MAX_LOOP_LEN;
+            for (int i = 0; i < fillLEDs; i++) {
+                rgb[i*3] = 80; // dim red
+            }
+        }
+    }
+    
+    // Playback dots (left and right channels)
+    if (loop_exists && !recording) {
+        int pos_left = (read_left * 24) / left_len;
+        int pos_right = (read_right * 24) / right_len;
+        // left dot blue
+        rgb[pos_left*3 + 2] = 255;
+        // right dot green
+        rgb[pos_right*3 + 1] = 255;
+        // if overlapping, combine (cyan)
+        if (pos_left == pos_right) {
+            rgb[pos_left*3 + 1] = 255;
+        }
+    }
+    
+    // Quarter-note flash (additive white)
+    if (flashActive) {
+        for (int i = 0; i < 24; i++) {
+            rgb[i*3]   = add_clamp(rgb[i*3], flashBrightness);
+            rgb[i*3+1] = add_clamp(rgb[i*3+1], flashBrightness);
+            rgb[i*3+2] = add_clamp(rgb[i*3+2], flashBrightness);
+        }
+    }
 }
 
 void update_beats_per_loop() {
@@ -581,6 +703,11 @@ void AudioCallback(AudioHandle::InputBuffer in,
                 clock_phase -= 1.0f;
                 sendMIDIRealTime(0xF8);
                 midi_clock_beat_counter++;
+                // Quarter‑note flash trigger
+                if (midi_clock_beat_counter % 6 == 0) {
+                    flashActive = true;
+                    flashBrightness = 128;
+                }
                 if (midi_clock_beat_counter >= 24) {
                     midi_clock_beat_counter = 0;
                     if (sync_requested) {
@@ -607,6 +734,22 @@ void AudioCallback(AudioHandle::InputBuffer in,
         }
         bool led_on = (led_timer > 0 || debug_led_timer > 0);
         hw.SetLed(led_on);
+    }
+    // LED update (30 Hz)
+    ledUpdateCounter += size;
+    if (ledUpdateCounter >= ledUpdateInterval) {
+        ledUpdateCounter -= ledUpdateInterval;
+        // Update flash animation
+        if (flashActive) {
+            if (flashBrightness > flashDecay) {
+                flashBrightness -= flashDecay;
+            } else {
+                flashBrightness = 0;
+                flashActive = false;
+            }
+        }
+        computeLEDFrame(ledFrame);
+        sendLEDFrame(ledFrame);
     }
 }
 
@@ -639,6 +782,15 @@ int main(void)
     adc_config[4].InitSingle(seed::A4);
     hw.adc.Init(adc_config, 5);
     hw.adc.Start();
+
+    // I2C for Neopixel ring (ATtiny85 slave)
+    I2CHandle::Config i2c_cfg;
+    i2c_cfg.periph = I2CHandle::Config::Peripheral::I2C_1;
+    i2c_cfg.speed = I2CHandle::Config::Speed::I2C_400KHZ;
+    i2c_cfg.mode = I2CHandle::Config::Mode::I2C_MASTER;
+    i2c_cfg.pin_config.scl = seed::D11;
+    i2c_cfg.pin_config.sda = seed::D12;
+    i2c.Init(i2c_cfg);
 
     // Ramp, limiter
     float ramp_samples = FB_RAMP_TIME_MS * sample_rate / 1000.0f;
