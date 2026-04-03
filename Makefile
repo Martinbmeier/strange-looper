@@ -3,8 +3,7 @@ TARGET = MySynthSeed
 
 # Sources
 CPP_SOURCES = \
-	MySynthSeed.cpp \
-	lib/Adafruit_NeoPixel/Adafruit_NeoPixel.cpp
+	MySynthSeed.cpp 
 
 # Library Locations
 LIBDAISY_DIR = ../../libDaisy/
@@ -17,5 +16,4 @@ include $(SYSTEM_FILES_DIR)/Makefile
 LDFLAGS += -u _printf_float
 
 C_INCLUDES += \
-    -I. \
-    -Ilib/Adafruit_NeoPixel
+    -I. 
