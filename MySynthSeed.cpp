@@ -25,9 +25,12 @@ DaisySeed hw;
 // Buffer definitions – two mono buffers in SDRAM
 // ------------------------------------------------------------------
 #define MAX_LOOP_LEN (48000 * 60)          // 60 seconds mono at 48kHz (stereo would be double)
+#define BASE_MAX_LEN (48000 * 30)          // 30 seconds, half of MAX_LOOP_LEN, used for multiply function base snapshot
+#define FEEDBACK_LATENCY_SAMPLES 96        // Compensate for external loop latency (adjust as needed)
 float DSY_SDRAM_BSS buffer[2][2][MAX_LOOP_LEN]; // [pair][channel][sample]
 // pair 0 = Buffer1, pair 1 = Buffer2
 // channel 0 = left, channel 1 = right
+int16_t DSY_SDRAM_BSS base_buffer[2][BASE_MAX_LEN]; // snapshot of base loop (channel 0 = left, 1 = right)
 
 size_t left_len = 0, right_len = 0;
 bool loop_exists = false;   // true if both buffers have content
@@ -60,11 +63,22 @@ Switch beat_up_sw, beat_down_sw;   // pins D9, D10
 Switch replace_sw;           // pin D6
 Switch phase_shift_sw;       // pin D14
 Switch buffer_select_sw;     // pin D5
+Switch multiply_sw;          // pin D8
 
 bool replace_active = false;
 float pot_crossfade = 0.0f;
 bool buffer_selected = false;   // false = Buffer1, true = Buffer2
 float crossfade_gain = 0.0f;    // 0.0 = full Buffer1, 1.0 = full Buffer2
+
+bool multiply_enabled = false;
+bool multiply_pending = false;
+size_t multiply_len_left = 0, multiply_len_right = 0;
+
+bool base_valid = false;
+size_t base_len_left = 0, base_len_right = 0;
+
+void update_phase_shift();
+void update_clock_inc();
 
 enum Mode { MODE_RECORD, MODE_IDLE, MODE_OVERDUB };
 Mode get_mode() {
@@ -101,10 +115,11 @@ bool sent_start = false;
 bool sync_requested = false;
 bool remix_requested = false;
 
-//GPIO midi_led;
 int midi_clock_beat_counter = 0;
 int led_timer = 0;
 const int LED_BLINK_DURATION_SAMPLES = 1000;
+int debug_led_timer = 0;
+const int DEBUG_BLINK_DURATION_SAMPLES = 2000;
 
 void update_clock_inc() {
     if (loop_exists && beats_per_loop > 0) {
@@ -142,21 +157,21 @@ const float ATTACK_MS = 1.0f;
 const float RELEASE_MS = 100.0f;
 float attack_coeff, release_coeff;
 
-void apply_limiter(float& in_l, float& in_r) {
-    float abs_l = fabsf(in_l);
-    float abs_r = fabsf(in_r);
-    float peak = (abs_l > abs_r) ? abs_l : abs_r;
-    if (peak > env_l) {
-        env_l += attack_coeff * (peak - env_l);
-    } else {
-        env_l += release_coeff * (peak - env_l);
-    }
-    env_r = env_l;
-    float gain = 1.0f;
-    if (env_l > THRESHOLD) gain = THRESHOLD / env_l;
-    in_l *= gain;
-    in_r *= gain;
-}
+// void apply_limiter(float& in_l, float& in_r) {
+//     float abs_l = fabsf(in_l);
+//     float abs_r = fabsf(in_r);
+//     float peak = (abs_l > abs_r) ? abs_l : abs_r;
+//     if (peak > env_l) {
+//         env_l += attack_coeff * (peak - env_l);
+//     } else {
+//         env_l += release_coeff * (peak - env_l);
+//     }
+//     env_r = env_l;
+//     float gain = 1.0f;
+//     if (env_l > THRESHOLD) gain = THRESHOLD / env_l;
+//     in_l *= gain;
+//     in_r *= gain;
+// }
 
 float fb_ramp_gain = 0.0f;
 float fb_target_gain = 0.0f;
@@ -244,6 +259,71 @@ void remix_loop() {
 }
 
 // ------------------------------------------------------------------
+// Capture base snapshot (un‑overdubbed loop) into int16 buffer
+// ------------------------------------------------------------------
+void capture_base_snapshot() {
+    if (!loop_exists) return;
+    if (right_len > BASE_MAX_LEN) return; // too long
+    int src_buf = buffer_selected ? 1 : 0;
+    for (size_t i = 0; i < left_len; i++) {
+        float s = buffer[src_buf][0][i];
+        s = s > 1.0f ? 1.0f : (s < -1.0f ? -1.0f : s);
+        base_buffer[0][i] = (int16_t)(s * 32767.0f);
+    }
+    for (size_t i = 0; i < right_len; i++) {
+        float s = buffer[src_buf][1][i];
+        s = s > 1.0f ? 1.0f : (s < -1.0f ? -1.0f : s);
+        base_buffer[1][i] = (int16_t)(s * 32767.0f);
+    }
+    base_len_left = left_len;
+    base_len_right = right_len;
+    base_valid = true;
+    // hw.SetLed(true);
+    debug_led_timer = DEBUG_BLINK_DURATION_SAMPLES;
+}
+
+// ------------------------------------------------------------------
+// Multiply – add base loop snapshot to end of buffer
+// ------------------------------------------------------------------
+void multiply_loop() {
+    if (!loop_exists || !base_valid) return;
+    int src_buf = buffer_selected ? 1 : 0;
+    size_t old_left = left_len;
+    size_t old_right = right_len;
+    size_t new_left = old_left + base_len_left;
+    size_t new_right = old_right + base_len_right;
+    if (new_left > MAX_LOOP_LEN || new_right > MAX_LOOP_LEN) {
+        // cannot multiply beyond buffer size
+        return;
+    }
+    // copy left channel from base buffer (int16) to float buffer
+    for (size_t i = 0; i < base_len_left; i++) {
+        float sample = (float)base_buffer[0][i] / 32767.0f;
+        buffer[src_buf][0][old_left + i] = sample;
+    }
+    // copy right channel
+    for (size_t i = 0; i < base_len_right; i++) {
+        float sample = (float)base_buffer[1][i] / 32767.0f;
+        buffer[src_buf][1][old_right + i] = sample;
+    }
+    left_len = new_left;
+    right_len = new_right;
+    // adjust write pointers if they wrapped
+    if (write_left == 0) {
+        write_left = old_left;
+    }
+    if (write_right == 0) {
+        write_right = old_right;
+    }
+    // update phase shift and clock
+    update_phase_shift();
+    update_clock_inc();
+    multiply_pending = false;
+    hw.SetLed(true);
+    debug_led_timer = DEBUG_BLINK_DURATION_SAMPLES;
+}
+
+// ------------------------------------------------------------------
 // Phase shift – update left_len when switch toggles or beats change
 // ------------------------------------------------------------------
 bool phase_shift_active = false;
@@ -302,7 +382,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
 
     // Write speed: 1× for initial recording, varispeed for overdub
     float write_speed = 1.0f;
-    if (loop_exists && current_mode == MODE_OVERDUB) {
+    if (loop_exists && (current_mode == MODE_OVERDUB || multiply_enabled || fb_write)) {
         write_speed = fabsf(read_speed);
     }
 
@@ -325,7 +405,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
         // --- Process external return (gain, limiter, ramp) ---
         float gain_stage_l = ext_raw_l * pot_fb_gain;
         float gain_stage_r = ext_raw_r * pot_fb_gain;
-        apply_limiter(gain_stage_l, gain_stage_r);
+        // apply_limiter(gain_stage_l, gain_stage_r);
         float feedback_l = gain_stage_l * fb_ramp_gain * FB_ATTEN;
         float feedback_r = gain_stage_r * fb_ramp_gain * FB_ATTEN;
 
@@ -374,20 +454,27 @@ void AudioCallback(AudioHandle::InputBuffer in,
         float new_l = 0.0f, new_r = 0.0f;
         bool do_write = false;
 
-        if (current_mode == MODE_RECORD || (loop_exists && replace_active)) {
+        if (fb_write) {
+            // Feedback recording replaces loop with external input
+            new_l = feedback_l;
+            new_r = feedback_r;
+            if (current_mode == MODE_OVERDUB) {
+                // Add instrument input (overdub) on top of feedback
+                new_l += instr_l;
+                new_r += instr_r;
+            }
+            do_write = true;
+        }
+        else if (current_mode == MODE_RECORD || (loop_exists && replace_active)) {
             // Record or replace: overwrite with instrument input
             new_l = instr_l;
             new_r = instr_r;
             do_write = true;
         }
         else if (loop_exists && current_mode == MODE_OVERDUB) {
-            // Overdub: add new material (instrument + optional feedback) to existing buffer
+            // Overdub without feedback (instrument only)
             new_l = instr_l;
             new_r = instr_r;
-            if (fb_write) {
-                new_l += feedback_l;
-                new_r += feedback_r;
-            }
             // Only write if there is any new material (prevents writing silence over the loop)
             if (fabsf(new_l) > 1e-6f || fabsf(new_r) > 1e-6f) {
                 do_write = true;
@@ -400,7 +487,7 @@ void AudioCallback(AudioHandle::InputBuffer in,
             float cur_left = buffer[write_buf][0][write_left];
             float cur_right = buffer[write_buf][1][write_right];
 
-            if (current_mode == MODE_RECORD || (replace_active && loop_exists)) {
+            if (fb_write || current_mode == MODE_RECORD || (replace_active && loop_exists)) {
                 // Overwrite (record or replace)
                 buffer[write_buf][0][write_left] = new_l;
                 buffer[write_buf][1][write_right] = new_r;
@@ -459,17 +546,30 @@ void AudioCallback(AudioHandle::InputBuffer in,
         }
 
         // --- Update write pointers (tape moves at write_speed, always) ---
-        if (current_mode == MODE_RECORD || (loop_exists && (current_mode == MODE_OVERDUB || replace_active))) {
+        if (current_mode == MODE_RECORD || fb_write || (loop_exists && (current_mode == MODE_OVERDUB || replace_active || multiply_enabled))) {
             write_phase_left += write_speed;
+            write_phase_right += write_speed;
             while (write_phase_left >= 1.0f) {
                 write_phase_left -= 1.0f;
-                if (current_mode == MODE_RECORD && !loop_exists) {
+                write_phase_right -= 1.0f;
+                if ((current_mode == MODE_RECORD || fb_write) && !loop_exists) {
                     // First recording: use MAX_LOOP_LEN as temporary buffer
                     write_left = (write_left + 1) % MAX_LOOP_LEN;
                     write_right = (write_right + 1) % MAX_LOOP_LEN;
                 } else {
-                    write_left = (write_left + 1) % left_len;
-                    write_right = (write_right + 1) % right_len;
+                    size_t new_left = (write_left + 1) % left_len;
+                    size_t new_right = (write_right + 1) % right_len;
+                    if (multiply_enabled && base_valid && loop_exists && right_len > 0) {
+                        if (new_right == 0) {
+                            multiply_len_left = left_len;
+                            multiply_len_right = right_len;
+                            multiply_pending = true;
+                            hw.SetLed(true);
+                            debug_led_timer = DEBUG_BLINK_DURATION_SAMPLES;
+                        }
+                    }
+                    write_left = new_left;
+                    write_right = new_right;
                 }
             }
         }
@@ -494,15 +594,19 @@ void AudioCallback(AudioHandle::InputBuffer in,
                         write_phase_right = 0.0f;
                         sync_requested = false;
                     }
-                    // midi_led.Write(true);
-                    // led_timer = LED_BLINK_DURATION_SAMPLES;
+                    hw.SetLed(true);
+                    led_timer = LED_BLINK_DURATION_SAMPLES;
                 }
             }
         }
-        // if (led_timer > 0) {
-        //     led_timer--;
-        //     if (led_timer == 0) midi_led.Write(false);
-        // }
+        if (led_timer > 0) {
+            led_timer--;
+        }
+        if (debug_led_timer > 0) {
+            debug_led_timer--;
+        }
+        bool led_on = (led_timer > 0 || debug_led_timer > 0);
+        hw.SetLed(led_on);
     }
 }
 
@@ -524,6 +628,7 @@ int main(void)
     sync_sw.Init(seed::D30, sample_rate / 48.0f);
     remix_sw.Init(seed::D7, sample_rate / 48.0f);
     replace_sw.Init(seed::D6, sample_rate / 48.0f);
+    multiply_sw.Init(seed::D8, sample_rate / 48.0f);
 
     // ADC
     AdcChannelConfig adc_config[5];
@@ -572,7 +677,7 @@ int main(void)
 
     // Audio
     AudioHandle::Config audio_cfg;
-    audio_cfg.blocksize  = 48;
+    audio_cfg.blocksize  = 96;
     audio_cfg.samplerate = SaiHandle::Config::SampleRate::SAI_48KHZ;
     audio_cfg.postgain   = 1.0f;
     hw.audio_handle.Init(audio_cfg, hw.AudioSaiHandle(), external_sai_handle);
@@ -599,6 +704,7 @@ int main(void)
         rev_switch.Debounce();
         phase_shift_sw.Debounce();
         buffer_select_sw.Debounce();
+        multiply_sw.Debounce();
 
         beat_up_sw.Debounce();
         beat_down_sw.Debounce();
@@ -606,6 +712,10 @@ int main(void)
         replace_sw.Debounce();
         replace_active = replace_sw.Pressed();   // true while button held
         buffer_selected = buffer_select_sw.Pressed();
+        multiply_enabled = multiply_sw.Pressed();
+        if (multiply_sw.RisingEdge() && loop_exists && right_len <= BASE_MAX_LEN) {
+            capture_base_snapshot();
+        }
         if (replace_sw.RisingEdge() && loop_exists) {
             // Align write pointers to read pointers for immediate replacement
             write_left = read_left;
@@ -668,6 +778,18 @@ int main(void)
         if (fb_state != last_fb_state) {
             fb_target_gain = (fb_state != FB_OFF) ? 1.0f : 0.0f;
             last_fb_state = fb_state;
+            // Visual feedback for FB_RECORD
+            if (fb_state == FB_RECORD) {
+                debug_led_timer = DEBUG_BLINK_DURATION_SAMPLES;
+                // Align write pointers to read pointers with latency compensation
+                if (loop_exists) {
+                    size_t offset = FEEDBACK_LATENCY_SAMPLES;
+                    write_left = (read_left + left_len - offset) % left_len;
+                    write_right = (read_right + right_len - offset) % right_len;
+                    write_phase_left = read_phase_left;
+                    write_phase_right = read_phase_right;
+                }
+            }
         }
 
         sync_sw.Debounce();
@@ -676,6 +798,10 @@ int main(void)
         remix_sw.Debounce();
         if (remix_sw.RisingEdge() && loop_exists && get_mode() != MODE_RECORD) {
             remix_loop();
+        }
+
+        if (multiply_pending) {
+            multiply_loop();
         }
 
         // Mode current_mode = get_mode();
@@ -691,16 +817,19 @@ int main(void)
             read_right = 0;
             read_phase_left = 0.0f;
             read_phase_right = 0.0f;
+            write_phase_left = 0.0f;
+            write_phase_right = 0.0f;
             left_len = 0;
             right_len = 0;
             loop_exists = false;
+            base_valid = false;
             // Clear both buffer pairs (user decision: clear both, record into selected pair)
-            for (size_t i = 0; i < MAX_LOOP_LEN; i++) {
-                buffer[0][0][i] = 0.0f;
-                buffer[0][1][i] = 0.0f;
-                buffer[1][0][i] = 0.0f;
-                buffer[1][1][i] = 0.0f;
-            }
+            // for (size_t i = 0; i < MAX_LOOP_LEN; i++) {
+            //     buffer[0][0][i] = 0.0f;
+            //     buffer[0][1][i] = 0.0f;
+            //     buffer[1][0][i] = 0.0f;
+            //     buffer[1][1][i] = 0.0f;
+            // }
             was_recording = true;
             sent_start = false;
             sendMIDIRealTime(0xFC);
@@ -727,6 +856,7 @@ int main(void)
                 }
             } else {
                 loop_exists = false;
+                base_valid = false;
                 left_len = right_len = 0;
                 send_clock = false;
             }
