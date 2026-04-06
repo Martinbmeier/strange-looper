@@ -54,16 +54,22 @@ float playhead_speed = 1.0f;   // signed, same for both channels
 // ------------------------------------------------------------------
 MidiUartHandler midi;
 I2CHandle i2c;
+bool i2c_ready = false;
+uint32_t i2c_error_count = 0;
 
 // Neopixel LED ring state
-uint8_t ledFrame[72];
-uint32_t ledUpdateCounter = 0;
-const uint32_t ledUpdateInterval = 1600; // 48kHz / 30Hz
+// uint8_t ledFrame[72];
+// bool ledFrameReady = false;
+// uint32_t ledUpdateCounter = 0;
+// const uint32_t ledUpdateInterval = 3200; // 48kHz / 15Hz
 
 // Quarter-note flash animation
-bool flashActive = false;
-uint8_t flashBrightness = 0;
-const uint8_t flashDecay = 16; // per frame
+// bool flashActive = false;
+// uint8_t flashBrightness = 0;
+// const uint8_t flashDecay = 16; // per frame
+volatile bool beat_tick_pending = false;
+static uint32_t lastPos = 0;
+
 
 // Background pulse for mode (record/overdub/feedback)
 float pulsePhase = 0.0f;
@@ -155,110 +161,145 @@ void sendMIDIRealTime(uint8_t msg) {
     midi.SendMessage(data, 1);
 }
 
-void sendLEDFrame(uint8_t rgb[72]) {
-    uint8_t data[73];
-    data[0] = 0xFF; // batch command
-    for (int i = 0; i < 72; i++) {
-        data[i + 1] = rgb[i];
-    }
-    i2c.TransmitBlocking(0x26, data, 73, 10); // 10 ms timeout
+// void sendLEDFrame(uint8_t rgb[72]) {
+//     if (!i2c_ready) return;
+//     uint8_t data[73];
+//     data[0] = 0xFF; // batch command
+//     for (int i = 0; i < 72; i++) {
+//         data[i + 1] = rgb[i];
+//     }
+//     I2CHandle::Result res = i2c.TransmitBlocking(0x26, data, 73, 20); // 20 ms timeout
+//     if (res != I2CHandle::Result::OK) {
+//         i2c_error_count++;
+//         debug_led_timer = DEBUG_BLINK_DURATION_SAMPLES;
+//         // i2c_ready = false; // disable further attempts
+//     }
+// }
+
+// Send a single‑byte beat tick (quarter‑note flash)
+void sendBeatTick() {
+    if (!i2c_ready) return;
+    uint8_t data = 0x01;
+    i2c.TransmitBlocking(0x26, &data, 1, 10);
+}
+
+// Send left/right playhead positions (0‑1000 each)
+void sendPositions(uint16_t left, uint16_t right, uint16_t fill) {
+    uint8_t data[7] = {0x02,
+        (uint8_t)(left >> 8), (uint8_t)(left & 0xFF),
+        (uint8_t)(right >> 8), (uint8_t)(right & 0xFF),
+        (uint8_t)(fill >> 8), (uint8_t)(fill & 0xFF)};
+    i2c.TransmitBlocking(0x26, data, 7, 10);
+}
+
+// Send looper mode (0=idle,1=record,2=overdub,3=feedback‑record, 4=feedback‑monitor)
+void sendMode(uint8_t mode) {
+    if (!i2c_ready) return;
+    uint8_t data[2] = { 0x03, mode };
+    i2c.TransmitBlocking(0x26, data, 2, 10);
+}
+
+void sendRemix(bool trigger) {
+    if (!i2c_ready) return;
+    uint8_t data[2] = { 0x04, trigger ? 1 : 0 };
+    i2c.TransmitBlocking(0x26, data, 2, 10);
 }
 
 // Helper: add with saturation (cap at 255)
-static inline uint8_t add_clamp(uint8_t a, uint8_t b) {
-    int sum = a + b;
-    return sum > 255 ? 255 : sum;
-}
+// static inline uint8_t add_clamp(uint8_t a, uint8_t b) {
+//     int sum = a + b;
+//     return sum > 255 ? 255 : sum;
+// }
 
-void computeLEDFrame(uint8_t rgb[72]) {
-    memset(rgb, 0, 72);
+// void computeLEDFrame(uint8_t rgb[72]) {
+//     memset(rgb, 0, 72);
     
-    // Get current mode
-    Mode mode = get_mode();
-    FeedbackState fb = get_fb_state();
-    bool recording = (mode == MODE_RECORD);
-    bool overdubbing = (mode == MODE_OVERDUB);
-    bool feedbackRecord = (fb == FB_RECORD);
+//     // Get current mode
+//     Mode mode = get_mode();
+//     FeedbackState fb = get_fb_state();
+//     bool recording = (mode == MODE_RECORD);
+//     bool overdubbing = (mode == MODE_OVERDUB);
+//     bool feedbackRecord = (fb == FB_RECORD);
     
-    // Update global pulse phase (called each frame)
-    pulsePhase += pulseInc;
-    if (pulsePhase > 6.283185f) pulsePhase -= 6.283185f; // 2*PI
-    float pulseBrightness = 0.3f + 0.2f * sinf(pulsePhase); // 0.1-0.5
+//     // Update global pulse phase (called each frame)
+//     pulsePhase += pulseInc;
+//     if (pulsePhase > 6.283185f) pulsePhase -= 6.283185f; // 2*PI
+//     float pulseBrightness = 0.3f + 0.2f * sinf(pulsePhase); // 0.1-0.5
     
-    // Determine base color for background effect
-    uint8_t bg_r = 0, bg_g = 0, bg_b = 0;
-    if (recording) {
-        bg_r = 50; // dim red
-    } else if (overdubbing && !feedbackRecord) {
-        bg_r = 30; bg_g = 30; // yellow (mix)
-    } else if (feedbackRecord) {
-        bg_r = 30; bg_b = 30; // purple
-    }
+//     // Determine base color for background effect
+//     uint8_t bg_r = 0, bg_g = 0, bg_b = 0;
+//     if (recording) {
+//         bg_r = 50; // dim red
+//     } else if (overdubbing && !feedbackRecord) {
+//         bg_r = 30; bg_g = 30; // yellow (mix)
+//     } else if (feedbackRecord) {
+//         bg_r = 30; bg_b = 30; // purple
+//     }
     
-    // Apply background pulse to all LEDs (except where foreground overrides)
-    for (int i = 0; i < 24; i++) {
-        rgb[i*3]   = (uint8_t)(bg_r * pulseBrightness);
-        rgb[i*3+1] = (uint8_t)(bg_g * pulseBrightness);
-        rgb[i*3+2] = (uint8_t)(bg_b * pulseBrightness);
-    }
+//     // Apply background pulse to all LEDs (except where foreground overrides)
+//     for (int i = 0; i < 24; i++) {
+//         rgb[i*3]   = (uint8_t)(bg_r * pulseBrightness);
+//         rgb[i*3+1] = (uint8_t)(bg_g * pulseBrightness);
+//         rgb[i*3+2] = (uint8_t)(bg_b * pulseBrightness);
+//     }
     
-    // Buffer fill progress bar (red)
-    if (recording || multiply_enabled) {
-        int fillLEDs;
-        if (recording) {
-            // fill based on write_right relative to MAX_LOOP_LEN
-            fillLEDs = (write_right * 24) / MAX_LOOP_LEN;
-            // blinking warning in last quarter
-            if (write_right > (MAX_LOOP_LEN * 3 / 4)) {
-                // blink at 0.5 Hz (every 2 seconds) using pulse phase
-                if ((int)(pulsePhase * 10) % 20 < 10) {
-                    // bright red
-                    for (int i = 0; i < fillLEDs; i++) {
-                        rgb[i*3] = 255;
-                        rgb[i*3+1] = 0;
-                        rgb[i*3+2] = 0;
-                    }
-                } else {
-                    // keep dim red background (already set)
-                }
-            } else {
-                // solid red at low brightness (overwrite background)
-                for (int i = 0; i < fillLEDs; i++) {
-                    rgb[i*3] = 100;
-                }
-            }
-        } else {
-            // multiply mode: fill based on current loop length vs max
-            fillLEDs = (right_len * 24) / MAX_LOOP_LEN;
-            for (int i = 0; i < fillLEDs; i++) {
-                rgb[i*3] = 80; // dim red
-            }
-        }
-    }
+//     // Buffer fill progress bar (red)
+//     if (recording || multiply_enabled) {
+//         int fillLEDs;
+//         if (recording) {
+//             // fill based on write_right relative to MAX_LOOP_LEN
+//             fillLEDs = (write_right * 24) / MAX_LOOP_LEN;
+//             // blinking warning in last quarter
+//             if (write_right > (MAX_LOOP_LEN * 3 / 4)) {
+//                 // blink at 0.5 Hz (every 2 seconds) using pulse phase
+//                 if ((int)(pulsePhase * 10) % 20 < 10) {
+//                     // bright red
+//                     for (int i = 0; i < fillLEDs; i++) {
+//                         rgb[i*3] = 255;
+//                         rgb[i*3+1] = 0;
+//                         rgb[i*3+2] = 0;
+//                     }
+//                 } else {
+//                     // keep dim red background (already set)
+//                 }
+//             } else {
+//                 // solid red at low brightness (overwrite background)
+//                 for (int i = 0; i < fillLEDs; i++) {
+//                     rgb[i*3] = 100;
+//                 }
+//             }
+//         } else {
+//             // multiply mode: fill based on current loop length vs max
+//             fillLEDs = (right_len * 24) / MAX_LOOP_LEN;
+//             for (int i = 0; i < fillLEDs; i++) {
+//                 rgb[i*3] = 80; // dim red
+//             }
+//         }
+//     }
     
-    // Playback dots (left and right channels)
-    if (loop_exists && !recording) {
-        int pos_left = (read_left * 24) / left_len;
-        int pos_right = (read_right * 24) / right_len;
-        // left dot blue
-        rgb[pos_left*3 + 2] = 255;
-        // right dot green
-        rgb[pos_right*3 + 1] = 255;
-        // if overlapping, combine (cyan)
-        if (pos_left == pos_right) {
-            rgb[pos_left*3 + 1] = 255;
-        }
-    }
+//     // Playback dots (left and right channels)
+//     if (loop_exists && !recording && left_len > 0 && right_len > 0) {
+//         int pos_left = (read_left * 24) / left_len;
+//         int pos_right = (read_right * 24) / right_len;
+//         // left dot blue
+//         rgb[pos_left*3 + 2] = 255;
+//         // right dot green
+//         rgb[pos_right*3 + 1] = 255;
+//         // if overlapping, combine (cyan)
+//         if (pos_left == pos_right) {
+//             rgb[pos_left*3 + 1] = 255;
+//         }
+//     }
     
     // Quarter-note flash (additive white)
-    if (flashActive) {
-        for (int i = 0; i < 24; i++) {
-            rgb[i*3]   = add_clamp(rgb[i*3], flashBrightness);
-            rgb[i*3+1] = add_clamp(rgb[i*3+1], flashBrightness);
-            rgb[i*3+2] = add_clamp(rgb[i*3+2], flashBrightness);
-        }
-    }
-}
+    // if (flashActive) {
+    //     for (int i = 0; i < 24; i++) {
+    //         rgb[i*3]   = add_clamp(rgb[i*3], flashBrightness);
+    //         rgb[i*3+1] = add_clamp(rgb[i*3+1], flashBrightness);
+    //         rgb[i*3+2] = add_clamp(rgb[i*3+2], flashBrightness);
+    //     }
+    // }
+// }
 
 void update_beats_per_loop() {
     int new_beats = base_beats * multiplier;
@@ -686,8 +727,8 @@ void AudioCallback(AudioHandle::InputBuffer in,
                             multiply_len_left = left_len;
                             multiply_len_right = right_len;
                             multiply_pending = true;
-                            hw.SetLed(true);
-                            debug_led_timer = DEBUG_BLINK_DURATION_SAMPLES;
+                            // hw.SetLed(true);
+                            // debug_led_timer = DEBUG_BLINK_DURATION_SAMPLES;
                         }
                     }
                     write_left = new_left;
@@ -704,10 +745,6 @@ void AudioCallback(AudioHandle::InputBuffer in,
                 sendMIDIRealTime(0xF8);
                 midi_clock_beat_counter++;
                 // Quarter‑note flash trigger
-                if (midi_clock_beat_counter % 6 == 0) {
-                    flashActive = true;
-                    flashBrightness = 128;
-                }
                 if (midi_clock_beat_counter >= 24) {
                     midi_clock_beat_counter = 0;
                     if (sync_requested) {
@@ -721,8 +758,9 @@ void AudioCallback(AudioHandle::InputBuffer in,
                         write_phase_right = 0.0f;
                         sync_requested = false;
                     }
-                    hw.SetLed(true);
-                    led_timer = LED_BLINK_DURATION_SAMPLES;
+                    // hw.SetLed(true);
+                    beat_tick_pending = true;
+                    // led_timer = LED_BLINK_DURATION_SAMPLES;
                 }
             }
         }
@@ -734,22 +772,6 @@ void AudioCallback(AudioHandle::InputBuffer in,
         }
         bool led_on = (led_timer > 0 || debug_led_timer > 0);
         hw.SetLed(led_on);
-    }
-    // LED update (30 Hz)
-    ledUpdateCounter += size;
-    if (ledUpdateCounter >= ledUpdateInterval) {
-        ledUpdateCounter -= ledUpdateInterval;
-        // Update flash animation
-        if (flashActive) {
-            if (flashBrightness > flashDecay) {
-                flashBrightness -= flashDecay;
-            } else {
-                flashBrightness = 0;
-                flashActive = false;
-            }
-        }
-        computeLEDFrame(ledFrame);
-        sendLEDFrame(ledFrame);
     }
 }
 
@@ -783,14 +805,47 @@ int main(void)
     hw.adc.Init(adc_config, 5);
     hw.adc.Start();
 
+    // hw.StartLog(true);
+
     // I2C for Neopixel ring (ATtiny85 slave)
     I2CHandle::Config i2c_cfg;
     i2c_cfg.periph = I2CHandle::Config::Peripheral::I2C_1;
-    i2c_cfg.speed = I2CHandle::Config::Speed::I2C_400KHZ;
+    i2c_cfg.speed = I2CHandle::Config::Speed::I2C_100KHZ;
     i2c_cfg.mode = I2CHandle::Config::Mode::I2C_MASTER;
     i2c_cfg.pin_config.scl = seed::D11;
     i2c_cfg.pin_config.sda = seed::D12;
-    i2c.Init(i2c_cfg);
+    i2c.Init(i2c_cfg);  // temporarily disabled to debug audio
+    i2c_ready = true;
+
+    // Test pattern to verify I2C communication
+    // if (i2c_ready) {
+    //     uint8_t testFrame[72];
+    //     // Solid red
+    //     memset(testFrame, 0, 72);
+    //     for (int i = 0; i < 24; i++) {
+    //         testFrame[i * 3] = 100;
+    //     }
+    //     sendLEDFrame(testFrame);
+    //     System::Delay(500);
+    //     // Solid green
+    //     memset(testFrame, 0, 72);
+    //     for (int i = 0; i < 24; i++) {
+    //         testFrame[i * 3 + 1] = 100;
+    //     }
+    //     sendLEDFrame(testFrame);
+    //     System::Delay(500);
+    //     // Solid blue
+    //     memset(testFrame, 0, 72);
+    //     for (int i = 0; i < 24; i++) {
+    //         testFrame[i * 3 + 2] = 100;
+    //     }
+    //     sendLEDFrame(testFrame);
+    //     System::Delay(500);
+    //     // Turn off
+    //     memset(testFrame, 0, 72);
+    //     sendLEDFrame(testFrame);
+    //     System::Delay(200);
+    // }
 
     // Ramp, limiter
     float ramp_samples = FB_RAMP_TIME_MS * sample_rate / 1000.0f;
@@ -950,10 +1005,44 @@ int main(void)
         remix_sw.Debounce();
         if (remix_sw.RisingEdge() && loop_exists && get_mode() != MODE_RECORD) {
             remix_loop();
+            sendRemix(true);
         }
 
         if (multiply_pending) {
             multiply_loop();
+        }
+
+        static uint8_t lastMode = 0xFF;
+        Mode mode = get_mode();
+        uint8_t m;
+        switch (mode) {
+            case MODE_RECORD:  m = 1; break;
+            case MODE_OVERDUB: m = 2; break;
+            default:           m = 0; break;
+        }
+        if (get_fb_state() == FB_RECORD) m = 3;
+        if (get_fb_state() == FB_MONITOR && mode!=MODE_OVERDUB) m = 4;
+        if (m != lastMode) {
+            sendMode(m);
+            lastMode = m;
+        }
+
+        uint16_t leftPos = 0, rightPos = 0, fillVal = 0;
+        if(current_mode == MODE_RECORD) {
+            fillVal  = (write_right * 1000) / MAX_LOOP_LEN;
+        } else {
+            leftPos  = (read_left * 1000) / left_len;
+            rightPos = (read_right * 1000) / right_len;
+        }
+        if (System::GetTick() - lastPos > 20) {
+            lastPos = System::GetTick();
+            sendPositions(leftPos, rightPos, fillVal);
+        }
+
+        if (beat_tick_pending) {
+            beat_tick_pending = false;
+            sendBeatTick();
+            // hw.PrintLine("Beat tick sent\n"); 
         }
 
         // Mode current_mode = get_mode();
