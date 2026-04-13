@@ -4,7 +4,7 @@
  * - Speed, reverse, feedback, MIDI clock, remix, sync buttons all work
  * - Phase shift switch (D11): when on, left loop is one beat shorter than right
  * - Offset accumulates each loop pass; eventually realigns
- * - Sync switch (D30): when pressed, next loop pass will realign to 0 phase
+ * - Sync switch (D30): when pressed, next loop pass will realign to nearest beat
  * - Replace switch (D6): when on, new recording replaces existing loop instead of overdubbing
  * - Remix switch (D7): when on, "remix" effects are engaged TODO: make more remix effects, 12 options with multi switch
  * - Beat up/down switches (D9, D10): make three options in total, 3, 4, 5 beats per loop (then can be multiplied)
@@ -343,6 +343,20 @@ float fb_ramp_step;
 const float FB_ATTEN = 0.92f;
 
 // ------------------------------------------------------------------
+// Rotary switch reading (ADC channel 5 = A5)
+// ------------------------------------------------------------------
+int readRotarySwitch() {
+    float v = hw.adc.GetFloat(5);          // channel 5 = A5
+    // hw.PrintLine("rotary adc: %f",v);
+    // Divide 0.0-1.0 into 12 equal bins
+    int pos = (int)(v * 12.0f);
+    if (pos >= 12) pos = 11;               // clamp for floating-point rounding
+    // Invert mapping so that physical position 1 (lowest voltage) → effect 0,
+    // physical position 12 (highest voltage) → effect 11.
+    return 11 - pos;
+}
+
+// ------------------------------------------------------------------
 // Remix function – works on both buffers identically
 // ------------------------------------------------------------------
 void remix_loop() {
@@ -356,6 +370,25 @@ void remix_loop() {
     // Determine source and destination buffer pairs
     int src_buf = buffer_selected ? 1 : 0;          // selected buffer (where recording/overdub goes)
     int dst_buf = 1 - src_buf;                     // the other buffer (where remix result will be written)
+
+    int effect = readRotarySwitch(); // 0..11
+
+    // Global reverse effect (position 6, effect index 5)
+    if (effect == 5) {
+        // Reverse entire loop
+        for (size_t i = 0; i < right_len; i++) {
+            size_t rev_idx = right_len - 1 - i;
+            buffer[dst_buf][0][i] = buffer[src_buf][0][rev_idx];
+            buffer[dst_buf][1][i] = buffer[src_buf][1][rev_idx];
+        }
+        // Left channel length may differ due to phase shift, reverse accordingly
+        for (size_t i = 0; i < left_len; i++) {
+            size_t rev_idx = left_len - 1 - i;
+            buffer[dst_buf][0][i] = buffer[src_buf][0][rev_idx];
+        }
+        sync_requested = true;
+        return;
+    }
 
     size_t n = beats_per_loop;
     size_t indices[n];
@@ -371,49 +404,240 @@ void remix_loop() {
         size_t src = indices[target];
         size_t src_start = src * seg_samples;
         size_t dst_start = target * seg_samples;
-        int effect = rand() % 4;
 
-        // Apply same effect to both channels
-        for (size_t j = 0; j < seg_samples; j++) {
-            size_t src_idx = src_start + j;
-            size_t dst_idx = dst_start + j;
-            float s_left = 0.0f, s_right = 0.0f;
-
-            switch (effect) {
+        if (effect == 0) {
+            // Random shuffle with four sub-effects
+            int sub = rand() % 4;
+            switch (sub) {
                 case 0: // normal copy
-                    s_left = buffer[src_buf][0][src_idx];
-                    s_right = buffer[src_buf][1][src_idx];
+                    for (size_t j = 0; j < seg_samples; j++) {
+                        buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + j];
+                        buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + j];
+                    }
                     break;
-                case 1: // reverse
-                    s_left = buffer[src_buf][0][src_start + (seg_samples - 1 - j)];
-                    s_right = buffer[src_buf][1][src_start + (seg_samples - 1 - j)];
+                case 1: // reverse segment
+                    for (size_t j = 0; j < seg_samples; j++) {
+                        size_t rev = seg_samples - 1 - j;
+                        buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + rev];
+                        buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + rev];
+                    }
                     break;
                 case 2: // double speed
-                    if (seg_samples % 2 != 0) {
-                        // odd segment length: fallback to normal copy
-                        s_left = buffer[src_buf][0][src_idx];
-                        s_right = buffer[src_buf][1][src_idx];
-                    } else {
+                    if (seg_samples % 2 == 0) {
                         size_t half = seg_samples / 2;
-                        // For both halves we read from source at double stride
-                        size_t src_sample = src_start + (j % half) * 2;
-                        s_left = buffer[src_buf][0][src_sample];
-                        s_right = buffer[src_buf][1][src_sample];
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            size_t src_sample = src_start + (j % half) * 2;
+                            buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_sample];
+                            buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_sample];
+                        }
+                    } else {
+                        // fallback to copy
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + j];
+                            buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + j];
+                        }
                     }
                     break;
                 case 3: // stutter
                     {
                         size_t half = seg_samples / 2;
                         if (half == 0) half = seg_samples;
-                        size_t rep = j % half;
-                        s_left = buffer[src_buf][0][src_start + rep];
-                        s_right = buffer[src_buf][1][src_start + rep];
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            size_t rep = j % half;
+                            buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + rep];
+                            buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + rep];
+                        }
                     }
                     break;
             }
-            // Write directly to destination buffer
-            buffer[dst_buf][0][dst_idx] = s_left;
-            buffer[dst_buf][1][dst_idx] = s_right;
+        } else {
+            // Effect 1‑11 (except 5 which is handled above)
+            switch (effect) {
+                case 1: // Random Speed‑Up
+                    {
+                        float factor = (rand() % 100) < 70 ? 2.0f : 1.0f;
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            float pos = (float)j * factor;
+                            size_t idx0 = (size_t)pos % seg_samples;
+                            size_t idx1 = (idx0 + 1) % seg_samples;
+                            float frac = pos - (float)idx0;
+                            buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + idx0] * (1.f - frac) + buffer[src_buf][0][src_start + idx1] * frac;
+                            buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + idx0] * (1.f - frac) + buffer[src_buf][1][src_start + idx1] * frac;
+                        }
+                    }
+                    break;
+                case 2: // Random Slow‑Down
+                    {
+                        float factor = (rand() % 100) < 70 ? 0.5f : 1.0f;
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            float pos = (float)j * factor;
+                            size_t idx0 = (size_t)pos % seg_samples;
+                            size_t idx1 = (idx0 + 1) % seg_samples;
+                            float frac = pos - (float)idx0;
+                            buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + idx0] * (1.f - frac) + buffer[src_buf][0][src_start + idx1] * frac;
+                            buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + idx0] * (1.f - frac) + buffer[src_buf][1][src_start + idx1] * frac;
+                        }
+                    }
+                    break;
+                case 3: // Musical 4ths & 5ths
+                    {
+                        float factor = (rand() % 2) ? (4.0f / 3.0f) : (3.0f / 2.0f); // fourth or fifth
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            float pos = (float)j * factor;
+                            size_t idx0 = (size_t)pos % seg_samples;
+                            size_t idx1 = (idx0 + 1) % seg_samples;
+                            float frac = pos - (float)idx0;
+                            buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + idx0] * (1.f - frac) + buffer[src_buf][0][src_start + idx1] * frac;
+                            buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + idx0] * (1.f - frac) + buffer[src_buf][1][src_start + idx1] * frac;
+                        }
+                    }
+                    break;
+                case 4: // Musical 5ths & 7ths
+                    {
+                        float factor = (rand() % 2) ? (3.0f / 2.0f) : (7.0f / 4.0f); // fifth or minor seventh
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            float pos = (float)j * factor;
+                            size_t idx0 = (size_t)pos % seg_samples;
+                            size_t idx1 = (idx0 + 1) % seg_samples;
+                            float frac = pos - (float)idx0;
+                            buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + idx0] * (1.f - frac) + buffer[src_buf][0][src_start + idx1] * frac;
+                            buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + idx0] * (1.f - frac) + buffer[src_buf][1][src_start + idx1] * frac;
+                        }
+                    }
+                    break;
+                case 6: // Stutter (same as random shuffle's stutter but applied to whole segment)
+                    {
+                        size_t half = seg_samples / 2;
+                        if (half == 0) half = seg_samples;
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            size_t rep = j % half;
+                            buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + rep];
+                            buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + rep];
+                        }
+                    }
+                    break;
+                case 7: // Time Stretch (factor 2 or 0.5)
+                    {
+                        float factor = (rand() % 2) ? 2.0f : 0.5f;
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            float pos = (float)j * factor;
+                            size_t idx0 = (size_t)pos % seg_samples;
+                            size_t idx1 = (idx0 + 1) % seg_samples;
+                            float frac = pos - (float)idx0;
+                            buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + idx0] * (1.f - frac) + buffer[src_buf][0][src_start + idx1] * frac;
+                            buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + idx0] * (1.f - frac) + buffer[src_buf][1][src_start + idx1] * frac;
+                        }
+                    }
+                    break;
+                case 8: // Granular Scatter
+                    {
+                        size_t grain_count = 4;
+                        size_t grain_samples = seg_samples / grain_count;
+                        size_t remainder = seg_samples % grain_count;
+                        size_t grain_start[grain_count];
+                        size_t grain_len[grain_count];
+                        size_t acc = 0;
+                        for (size_t g = 0; g < grain_count; g++) {
+                            grain_len[g] = grain_samples + (g < remainder ? 1 : 0);
+                            grain_start[g] = acc;
+                            acc += grain_len[g];
+                        }
+                        // random permutation of grain indices
+                        size_t order[grain_count];
+                        for (size_t g = 0; g < grain_count; g++) order[g] = g;
+                        for (size_t g = grain_count - 1; g > 0; g--) {
+                            size_t r = rand() % (g + 1);
+                            size_t tmp = order[g];
+                            order[g] = order[r];
+                            order[r] = tmp;
+                        }
+                        // copy grains in random order
+                        size_t dst_pos = 0;
+                        for (size_t g = 0; g < grain_count; g++) {
+                            size_t src_grain = order[g];
+                            size_t src_grain_start = src_start + grain_start[src_grain];
+                            size_t len = grain_len[src_grain];
+                            for (size_t k = 0; k < len; k++) {
+                                buffer[dst_buf][0][dst_start + dst_pos + k] = buffer[src_buf][0][src_grain_start + k];
+                                buffer[dst_buf][1][dst_start + dst_pos + k] = buffer[src_buf][1][src_grain_start + k];
+                            }
+                            dst_pos += len;
+                        }
+                    }
+                    break;
+                case 9: // Pitch Shift
+                    {
+                        float factor = (rand() % 2) ? 1.189207f : 1.498307f; // +3 or +7 semitones
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            float pos = (float)j * factor;
+                            size_t idx0 = (size_t)pos % seg_samples;
+                            size_t idx1 = (idx0 + 1) % seg_samples;
+                            float frac = pos - (float)idx0;
+                            buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + idx0] * (1.f - frac) + buffer[src_buf][0][src_start + idx1] * frac;
+                            buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + idx0] * (1.f - frac) + buffer[src_buf][1][src_start + idx1] * frac;
+                        }
+                    }
+                    break;
+                case 10: // Filter Sweep
+                    {
+                        // Compute cutoff sweep across segments
+                        float cutoff;
+                        if (n > 1) {
+                            cutoff = 20.0f + (target / (float)(n - 1)) * (20000.0f - 20.0f);
+                        } else {
+                            cutoff = 20.0f;
+                        }
+                        // Initialize state‑variable filters
+                        Svf filt_left, filt_right;
+                        filt_left.Init(sample_rate);
+                        filt_right.Init(sample_rate);
+                        filt_left.SetFreq(cutoff);
+                        filt_right.SetFreq(cutoff);
+                        filt_left.SetRes(0.5f);
+                        filt_right.SetRes(0.5f);
+                        // Process each sample
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            float in_left = buffer[src_buf][0][src_start + j];
+                            float in_right = buffer[src_buf][1][src_start + j];
+                            filt_left.Process(in_left);
+                            filt_right.Process(in_right);
+                            buffer[dst_buf][0][dst_start + j] = filt_left.Low();
+                            buffer[dst_buf][1][dst_start + j] = filt_right.Low();
+                        }
+                    }
+                    break;
+                case 11: // Bitcrush
+                    {
+                        const int bits = 4;
+                        const int downsample = 4;
+                        const int levels = (1 << bits) - 1; // 15 for 4 bits
+                        for (size_t j = 0; j < seg_samples; j++) {
+                            // Downsample: repeat same source sample for each downsample factor
+                            size_t src_idx = src_start + (j / downsample) * downsample;
+                            if (src_idx >= src_start + seg_samples)
+                                src_idx = src_start + seg_samples - 1;
+                            float left = buffer[src_buf][0][src_idx];
+                            float right = buffer[src_buf][1][src_idx];
+                            // Quantize to bit depth
+                            float norm_left = (left + 1.0f) * 0.5f; // to [0,1]
+                            float norm_right = (right + 1.0f) * 0.5f;
+                            int q_left = (int)(norm_left * levels + 0.5f);
+                            int q_right = (int)(norm_right * levels + 0.5f);
+                            left = (q_left / (float)levels) * 2.0f - 1.0f;
+                            right = (q_right / (float)levels) * 2.0f - 1.0f;
+                            buffer[dst_buf][0][dst_start + j] = left;
+                            buffer[dst_buf][1][dst_start + j] = right;
+                        }
+                    }
+                    break;
+                default:
+                    // fallback copy (should not happen)
+                    for (size_t j = 0; j < seg_samples; j++) {
+                        buffer[dst_buf][0][dst_start + j] = buffer[src_buf][0][src_start + j];
+                        buffer[dst_buf][1][dst_start + j] = buffer[src_buf][1][src_start + j];
+                    }
+                    break;
+            }
         }
     }
 
@@ -748,10 +972,43 @@ void AudioCallback(AudioHandle::InputBuffer in,
                 if (midi_clock_beat_counter >= 24) {
                     midi_clock_beat_counter = 0;
                     if (sync_requested) {
-                        read_left = 0;
-                        read_right = 0;
-                        write_left = 0;
-                        write_right = 0;
+                        // Align to nearest beat instead of buffer start
+                        if (loop_exists && beats_per_loop > 0 && right_len > 0) {
+                            size_t beat_samples = right_len / beats_per_loop;
+                            if (beat_samples > 0) {
+                                // Compute nearest beat for right channel
+                                size_t current_beat = read_right / beat_samples;
+                                size_t offset = read_right % beat_samples;
+                                size_t nearest_beat = current_beat + (offset > beat_samples/2 ? 1 : 0);
+                                if (nearest_beat >= (size_t)beats_per_loop) nearest_beat = 0;
+                                size_t target_right = nearest_beat * beat_samples;
+                                // Compute shortest delta modulo right_len
+                                int delta = target_right - read_right;
+                                if (delta > (int)right_len/2) delta -= right_len;
+                                else if (delta < -(int)right_len/2) delta += right_len;
+                                // Apply delta to right channel pointers
+                                read_right = (read_right + delta + right_len) % right_len;
+                                write_right = (write_right + delta + right_len) % right_len;
+                                // Apply same delta to left channel (if loop exists)
+                                if (left_len > 0) {
+                                    read_left = (read_left + delta + left_len) % left_len;
+                                    write_left = (write_left + delta + left_len) % left_len;
+                                }
+                            } else {
+                                // fallback to zero alignment
+                                read_left = 0;
+                                read_right = 0;
+                                write_left = 0;
+                                write_right = 0;
+                            }
+                        } else {
+                            // no loop or beats, reset to zero
+                            read_left = 0;
+                            read_right = 0;
+                            write_left = 0;
+                            write_right = 0;
+                        }
+                        // Reset phases
                         read_phase_left = 0.0f;
                         read_phase_right = 0.0f;
                         write_phase_left = 0.0f;
@@ -796,13 +1053,14 @@ int main(void)
     multiply_sw.Init(seed::D8, sample_rate / 48.0f);
 
     // ADC
-    AdcChannelConfig adc_config[5];
+    AdcChannelConfig adc_config[6];
     adc_config[0].InitSingle(seed::A0);
     adc_config[1].InitSingle(seed::A1);
     adc_config[2].InitSingle(seed::A2);
     adc_config[3].InitSingle(seed::A3);
     adc_config[4].InitSingle(seed::A4);
-    hw.adc.Init(adc_config, 5);
+    adc_config[5].InitSingle(seed::A5);
+    hw.adc.Init(adc_config, 6);
     hw.adc.Start();
 
     // hw.StartLog(true);
